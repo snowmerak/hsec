@@ -9,6 +9,10 @@ import { Call as $Call, CancellablePromise as $CancellablePromise } from "@wails
 // @ts-ignore: Unused imports
 import * as $models from "./models.js";
 
+export function AddCredentialSlot(devicePath: string, pin: string, label: string): $CancellablePromise<$models.CredentialSlotInfo> {
+    return $Call.ByID(1175766813, devicePath, pin, label);
+}
+
 export function AddVault(path: string): $CancellablePromise<$models.vaultReference> {
     return $Call.ByID(1034230172, path);
 }
@@ -25,8 +29,16 @@ export function Create(alias: string, value: $models.vaultValueDocument): $Cance
     return $Call.ByID(3576119441, alias, value);
 }
 
+export function CredentialSlots(): $CancellablePromise<$models.CredentialSlotInfo[] | null> {
+    return $Call.ByID(193583873);
+}
+
 export function Delete(alias: string, expectedRevision: number): $CancellablePromise<void> {
     return $Call.ByID(1946683094, alias, expectedRevision);
+}
+
+export function DeleteCredentialSlot(slotID: string): $CancellablePromise<void> {
+    return $Call.ByID(3252409711, slotID);
 }
 
 export function Get(alias: string): $CancellablePromise<$models.vaultEntry> {
@@ -55,10 +67,8 @@ export function RotateDEK(): $CancellablePromise<$models.vaultStatus> {
 }
 
 /**
- * RotateKEK replaces the public root credential reference and rewraps the
- * metadata-store DEK without rewriting the encrypted vault metadata or values.
- * The vault must already be unlocked so the existing metadata-store DEK is
- * available for rewrapping.
+ * RotateKEK replaces the active slot's credential and rewraps the same vault
+ * DEK. Other credential slots remain valid.
  */
 export function RotateKEK(devicePath: string, pin: string): $CancellablePromise<$models.vaultStatus> {
     return $Call.ByID(1224869511, devicePath, pin);
@@ -74,6 +84,10 @@ export function Status(): $CancellablePromise<$models.vaultStatus> {
 
 export function Unlock(devicePath: string, pin: string): $CancellablePromise<$models.vaultStatus> {
     return $Call.ByID(463265505, devicePath, pin);
+}
+
+export function UnlockSlot(slotID: string, devicePath: string, pin: string): $CancellablePromise<$models.vaultStatus> {
+    return $Call.ByID(3580927717, slotID, devicePath, pin);
 }
 
 export function Update(alias: string, value: $models.vaultValueDocument, expectedRevision: number): $CancellablePromise<$models.vaultEntry> {

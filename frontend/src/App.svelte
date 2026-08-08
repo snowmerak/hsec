@@ -3,9 +3,11 @@
   import {Dialogs, Events} from "@wailsio/runtime";
   import Icon from "./lib/Icon.svelte";
   import {
+    defaultDeviceLabel,
     isPreview,
     vault,
     type AuthenticatorInfo,
+    type CredentialSlot,
     type VaultEntry,
     type VaultEntrySummary,
     type VaultReference,
@@ -39,6 +41,8 @@
   let status: VaultStatus | null = $state(null);
   let vaultReferences: VaultReference[] = $state([]);
   let authenticators: AuthenticatorInfo[] = $state([]);
+  let credentialSlots: CredentialSlot[] = $state([]);
+  let selectedSlotId = $state("");
   let selectedDevicePath = $state("");
   let loadingDevices = $state(false);
   let entries: VaultEntrySummary[] = $state([]);
@@ -50,6 +54,10 @@
   let kekRotationOpen = $state(false);
   let rotationDevicePath = $state("");
   let rotationPin = $state("");
+  let deviceManagerOpen = $state(false);
+  let addDevicePath = $state("");
+  let addDeviceLabel = $state("");
+  let addDevicePin = $state("");
   let dekRotationOpen = $state(false);
   let dekRotationRunning = $state(false);
   let dekProgress: DEKRotationProgress = $state({
@@ -107,6 +115,7 @@
     try {
       await refreshVaultReferences();
       status = await vault.Status();
+      if (status.selected) await refreshCredentialSlots();
       if (status.unlocked) {
         await refreshEntries();
       } else if (status.selected) {
@@ -154,6 +163,7 @@
       entries = [];
       selected = null;
       await refreshVaultReferences();
+      await refreshCredentialSlots();
       await refreshAuthenticators();
     } catch (error) {
       showError(error);
@@ -196,15 +206,25 @@
     try {
       const wasInitialized = status.initialized;
       status = wasInitialized
-        ? await vault.Unlock(selectedDevicePath, pin)
+        ? credentialSlots.length > 0
+          ? await vault.UnlockSlot(selectedSlotId, selectedDevicePath, pin)
+          : await vault.Unlock(selectedDevicePath, pin)
         : await vault.Initialize(selectedDevicePath, pin);
       pin = "";
+      await refreshCredentialSlots();
       await refreshEntries();
       showToast("success", wasInitialized ? "vault가 열렸습니다" : "vault가 준비됐습니다", "보안 키로 암호화 키를 안전하게 유도했습니다.");
     } catch (error) {
       showError(error);
     } finally {
       busy = false;
+    }
+  }
+
+  async function refreshCredentialSlots() {
+    credentialSlots = await vault.CredentialSlots();
+    if (!credentialSlots.some((slot) => slot.id === selectedSlotId)) {
+      selectedSlotId = credentialSlots[0]?.id ?? "";
     }
   }
 
@@ -256,7 +276,7 @@
       rotationPin = "";
       kekRotationOpen = false;
       await refreshVaultReferences();
-      showToast("success", "KEK를 회전했습니다", "새 credential로 metadata DEK를 다시 보호했습니다.");
+      showToast("success", "KEK를 회전했습니다", "활성 장치 슬롯의 credential로 같은 vault DEK를 다시 보호했습니다.");
     } catch (error) {
       showError(error);
     } finally {
@@ -287,6 +307,7 @@
     dekRotationRunning = true;
     try {
       status = await vault.RotateDEK();
+      await refreshCredentialSlots();
       dekRotationOpen = false;
       showToast("success", "DEK를 회전했습니다", `${entries.length}개 항목을 새 키로 다시 암호화했습니다.`);
     } catch (error) {
@@ -297,6 +318,75 @@
       dekRotationRunning = false;
       busy = false;
     }
+  }
+
+  async function openDeviceManager() {
+    if (busy) return;
+    deviceManagerOpen = true;
+    addDevicePin = "";
+    await Promise.all([refreshCredentialSlots(), refreshRotationAuthenticators()]);
+    const device = authenticators.find((item) => item.path === rotationDevicePath) ?? authenticators[0];
+    addDevicePath = device?.path ?? "";
+    addDeviceLabel = device ? defaultDeviceLabel(device) : "";
+  }
+
+  function closeDeviceManager() {
+    if (busy) return;
+    deviceManagerOpen = false;
+    addDevicePath = "";
+    addDeviceLabel = "";
+    addDevicePin = "";
+  }
+
+  function chooseAddDevice(device: AuthenticatorInfo) {
+    addDevicePath = device.path;
+    addDeviceLabel = defaultDeviceLabel(device);
+  }
+
+  async function refreshDeviceManagerAuthenticators() {
+    await refreshRotationAuthenticators();
+    const current = authenticators.find((device) => device.path === addDevicePath);
+    if (!current) {
+      const next = authenticators[0];
+      addDevicePath = next?.path ?? "";
+      addDeviceLabel = next ? defaultDeviceLabel(next) : "";
+    }
+  }
+
+  async function addCredentialSlot() {
+    if (!addDevicePath || busy) return;
+    busy = true;
+    try {
+      const slot = await vault.AddCredentialSlot(addDevicePath, addDevicePin, addDeviceLabel);
+      addDevicePin = "";
+      await refreshCredentialSlots();
+      showToast("success", "장치를 추가했습니다", `“${slot.label}” 레이블로 이 vault를 열 수 있습니다.`);
+    } catch (error) {
+      showError(error);
+    } finally {
+      busy = false;
+    }
+  }
+
+  function removeCredentialSlot(slot: CredentialSlot) {
+    requestConfirmation({
+      title: "장치 슬롯 삭제",
+      message: `“${slot.label}” 슬롯을 삭제합니다. 이 credential로는 더 이상 vault를 열 수 없습니다.`,
+      confirmLabel: "슬롯 삭제",
+      destructive: true,
+      action: async () => {
+        busy = true;
+        try {
+          await vault.DeleteCredentialSlot(slot.id);
+          await refreshCredentialSlots();
+          showToast("success", "장치 슬롯을 삭제했습니다", `“${slot.label}”의 접근 권한을 제거했습니다.`);
+        } catch (error) {
+          showError(error);
+        } finally {
+          busy = false;
+        }
+      },
+    });
   }
 
   async function refreshEntries(preferredAlias?: string) {
@@ -434,6 +524,7 @@
     revealed = [];
     dirty = false;
     await refreshVaultReferences();
+    await refreshCredentialSlots();
     await refreshAuthenticators();
   }
 
@@ -458,6 +549,8 @@
     fields = [];
     revealed = [];
     authenticators = [];
+    credentialSlots = [];
+    selectedSlotId = "";
     selectedDevicePath = "";
     dirty = false;
     await refreshVaultReferences();
@@ -538,6 +631,11 @@
 </script>
 
 <svelte:window onkeydown={(event) => {
+  if (event.key === "Escape" && deviceManagerOpen) {
+    event.preventDefault();
+    closeDeviceManager();
+    return;
+  }
   if (event.key === "Escape" && kekRotationOpen) {
     event.preventDefault();
     closeKEKRotation();
@@ -638,6 +736,24 @@
         <span class="selected-vault-path">{status.vaultPath}</span>
       </div>
 
+      {#if status.initialized && credentialSlots.length > 0}
+        <fieldset class="authenticator-picker">
+          <legend class="mp-field__label">사용할 장치 레이블</legend>
+          <div class="authenticator-list" role="radiogroup" aria-label="credential 슬롯">
+            {#each credentialSlots as slot (slot.id)}
+              <label class="authenticator-option" class:authenticator-option--selected={selectedSlotId === slot.id}>
+                <input type="radio" name="credential-slot" value={slot.id} bind:group={selectedSlotId}/>
+                <span class="authenticator-icon"><Icon name="key" size={19}/></span>
+                <span class="authenticator-copy">
+                  <strong>{slot.label}</strong>
+                  <span>이 레이블에 등록한 장치를 연결하세요</span>
+                </span>
+              </label>
+            {/each}
+          </div>
+        </fieldset>
+      {/if}
+
       <fieldset class="authenticator-picker">
         <div class="authenticator-picker-heading">
           <legend class="mp-field__label">FIDO2 보안 키</legend>
@@ -673,7 +789,7 @@
         <span class="mp-field__label">보안 키 PIN <span class="optional">(선택)</span></span>
         <input class="mp-input" name="pin" type="password" bind:value={pin} autocomplete="off" placeholder="플랫폼에서 직접 처리하면 비워 두세요"/>
       </label>
-      <button class="mp-button mp-button--primary unlock-action" type="submit" disabled={busy || loadingDevices || authenticators.length === 0}>
+      <button class="mp-button mp-button--primary unlock-action" type="submit" disabled={busy || loadingDevices || authenticators.length === 0 || (status.initialized && credentialSlots.length > 0 && !selectedSlotId)}>
         <Icon name="key"/>
         {busy ? "보안 키 기다리는 중…" : status.initialized ? "vault 열기" : "vault 만들기"}
       </button>
@@ -706,6 +822,10 @@
       </nav>
 
       <div class="sidebar-actions">
+        <button class="mp-button mp-button--ghost rotation-button" disabled={busy} title="장치 관리" onclick={openDeviceManager}>
+          <Icon name="usb"/>
+          <span class="sidebar-action-label">장치 관리</span>
+        </button>
         <button class="mp-button mp-button--ghost rotation-button" disabled={busy} title="DEK 회전" onclick={openDEKRotation}>
           <Icon name="refresh"/>
           <span class="sidebar-action-label">DEK 회전</span>
@@ -843,6 +963,91 @@
   </main>
 {/if}
 
+{#if deviceManagerOpen}
+  <div class="confirmation-backdrop" role="presentation">
+    <div class="mp-card rotation-dialog device-manager-dialog" role="dialog" aria-modal="true" aria-labelledby="device-manager-title">
+      <div class="rotation-form">
+        <div class="rotation-heading">
+          <div class="confirmation-icon"><Icon name="usb" size={22}/></div>
+          <div class="confirmation-copy">
+            <h2 id="device-manager-title">장치 관리</h2>
+            <p>레이블을 보고 슬롯을 고릅니다. 실제 장치는 잠금 해제할 때 사용자가 선택합니다.</p>
+          </div>
+        </div>
+
+        <section class="credential-slot-section" aria-labelledby="registered-slots-title">
+          <div class="authenticator-picker-heading">
+            <h3 id="registered-slots-title" class="mp-field__label">등록된 슬롯</h3>
+            <span>{credentialSlots.length}개</span>
+          </div>
+          <div class="credential-slot-list">
+            {#each credentialSlots as slot (slot.id)}
+              <div class="credential-slot-row">
+                <span class="authenticator-icon"><Icon name="key" size={18}/></span>
+                <span class="authenticator-copy">
+                  <strong>{slot.label}</strong>
+                  <span>{slot.active ? "현재 vault를 연 슬롯" : "다음 잠금 해제부터 선택 가능"}</span>
+                </span>
+                {#if slot.active}
+                  <span class="slot-badge">사용 중</span>
+                {:else}
+                  <button class="mp-button mp-button--ghost mp-button--sm" type="button" disabled={busy} onclick={() => removeCredentialSlot(slot)}>
+                    <Icon name="trash" size={15}/>
+                    삭제
+                  </button>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        </section>
+
+        <form class="credential-add-form" onsubmit={(event) => { event.preventDefault(); void addCredentialSlot(); }}>
+          <div class="authenticator-picker-heading">
+            <h3 class="mp-field__label">새 장치 추가</h3>
+            <button class="mp-button mp-button--ghost mp-button--sm" type="button" disabled={loadingDevices || busy} onclick={refreshDeviceManagerAuthenticators}>
+              <Icon name="refresh" size={15}/>
+              새로고침
+            </button>
+          </div>
+          {#if loadingDevices}
+            <div class="authenticator-empty"><span class="mp-spinner"></span>연결된 장치를 찾는 중…</div>
+          {:else if authenticators.length === 0}
+            <div class="authenticator-empty">연결된 FIDO2 보안 키가 없습니다.</div>
+          {:else}
+            <div class="authenticator-list compact-authenticator-list" role="radiogroup" aria-label="추가할 FIDO2 보안 키">
+              {#each authenticators as device (device.path)}
+                <label class="authenticator-option" class:authenticator-option--selected={addDevicePath === device.path}>
+                  <input type="radio" name="add-authenticator" value={device.path} checked={addDevicePath === device.path} onchange={() => chooseAddDevice(device)}/>
+                  <span class="authenticator-icon"><Icon name="usb" size={18}/></span>
+                  <span class="authenticator-copy">
+                    <strong>{device.product || "FIDO2 보안 키"}</strong>
+                    <span>{device.windowsHello ? "Windows Security에서 장치를 선택합니다" : device.manufacturer || "제조사 정보 없음"}</span>
+                  </span>
+                </label>
+              {/each}
+            </div>
+          {/if}
+          <label class="mp-field">
+            <span class="mp-field__label">레이블</span>
+            <input class="mp-input" bind:value={addDeviceLabel} maxlength="128" placeholder="예: 사무실 YubiKey"/>
+          </label>
+          <label class="mp-field">
+            <span class="mp-field__label">보안 키 PIN <span class="optional">(선택)</span></span>
+            <input class="mp-input" type="password" bind:value={addDevicePin} autocomplete="off" placeholder="플랫폼에서 직접 처리하면 비워 두세요"/>
+          </label>
+          <div class="confirmation-actions rotation-actions">
+            <button class="mp-button mp-button--secondary" type="button" disabled={busy} onclick={closeDeviceManager}>닫기</button>
+            <button class="mp-button mp-button--primary" type="submit" disabled={busy || loadingDevices || !addDevicePath || !addDeviceLabel.trim()}>
+              <Icon name="plus" size={16}/>
+              {busy ? "보안 키 기다리는 중…" : "장치 추가"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if kekRotationOpen}
   <div class="confirmation-backdrop" role="presentation">
     <div
@@ -862,12 +1067,12 @@
         <div class="confirmation-icon"><Icon name="key" size={22}/></div>
         <div class="confirmation-copy">
           <h2 id="rotation-title">Root KEK 회전</h2>
-          <p>새 FIDO credential과 salt를 만들고 metadata DEK를 다시 보호합니다.</p>
+          <p>활성 슬롯에 새 FIDO credential과 salt를 만들고 vault DEK를 다시 보호합니다.</p>
         </div>
       </div>
 
       <p class="rotation-warning">
-        다른 보안 키를 선택하면 현재 vault의 DEK는 유지한 채 새 Root KEK로 다시 보호됩니다.
+        현재 슬롯만 교체됩니다. 다른 장치 슬롯은 계속 사용할 수 있습니다.
       </p>
 
       <fieldset class="authenticator-picker rotation-authenticator-picker">
@@ -938,7 +1143,7 @@
 
         {#if dekProgress.phase === "ready"}
           <p class="rotation-warning">
-            새 데이터베이스가 완성될 때까지 기존 DB를 유지합니다. 복사 도중 종료되면 기존 DB로 돌아가며, 파일 교체 도중 종료되면 다음 실행에서 자동 복구합니다.
+            새 데이터베이스가 완성될 때까지 기존 DB를 유지합니다. 완료되면 현재 사용 중인 슬롯만 남고 다른 장치 슬롯은 모두 폐기됩니다. 중단 시 다음 실행에서 자동 복구합니다.
           </p>
         {:else}
           <div class="dek-progress" class:dek-progress--failed={dekProgress.phase === "failed"}>

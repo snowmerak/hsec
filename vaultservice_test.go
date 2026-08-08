@@ -63,7 +63,7 @@ func (a *fakeAuthenticator) counts() (credentials, derivations int) {
 	return a.credentials, a.derivations
 }
 
-func TestRotateKEKRewrapsMetadataAndPersistsNewAuthenticator(t *testing.T) {
+func TestRotateKEKRewrapsActiveSlotAndPersistsNewAuthenticator(t *testing.T) {
 	ctx := context.Background()
 	firstAuth := &fakeAuthenticator{marker: 1}
 	secondAuth := &fakeAuthenticator{marker: 2}
@@ -99,12 +99,16 @@ func TestRotateKEKRewrapsMetadataAndPersistsNewAuthenticator(t *testing.T) {
 	if _, err := service.Create(ctx, "rotation-test", value); err != nil {
 		t.Fatal(err)
 	}
-	beforeHeader, err := service.metadata.Header(ctx)
+	slots, err := service.CredentialSlots(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.metadata.Get(ctx, vaultDEKAlias); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("new vault stored a legacy FIDO vault-DEK credential: %v", err)
+	if len(slots) != 1 || !slots[0].Active || slots[0].Label != "Example First Key" {
+		t.Fatalf("unexpected initial credential slots: %+v", slots)
+	}
+	beforeSlot, err := service.vaultKeys.credentialSlot(ctx, slots[0].ID)
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	status, err := service.RotateKEK(ctx, devices[1].Path, "")
@@ -117,30 +121,19 @@ func TestRotateKEKRewrapsMetadataAndPersistsNewAuthenticator(t *testing.T) {
 	if !status.Initialized || !status.Unlocked {
 		t.Fatalf("unexpected rotated status: %+v", status)
 	}
-	afterHeader, err := service.metadata.Header(ctx)
+	afterSlot, err := service.vaultKeys.credentialSlot(ctx, slots[0].ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterHeader.Revision != beforeHeader.Revision+1 {
-		t.Fatalf("header revision = %d, want %d", afterHeader.Revision, beforeHeader.Revision+1)
+	if afterSlot.Info.ID != beforeSlot.Info.ID || afterSlot.Info.Label != beforeSlot.Info.Label {
+		t.Fatalf("KEK rotation changed slot identity: before=%+v after=%+v", beforeSlot.Info, afterSlot.Info)
 	}
-	if bytes.Equal(afterHeader.KEK.CredentialID, beforeHeader.KEK.CredentialID) ||
-		bytes.Equal(afterHeader.KEK.Salt, beforeHeader.KEK.Salt) {
-		t.Fatal("rotated header retained the previous KEK reference")
+	if bytes.Equal(afterSlot.Ref.CredentialID, beforeSlot.Ref.CredentialID) ||
+		bytes.Equal(afterSlot.Ref.Salt, beforeSlot.Ref.Salt) {
+		t.Fatal("rotated slot retained the previous KEK reference")
 	}
-	if bytes.Equal(afterHeader.WrappedDEK.Ciphertext, beforeHeader.WrappedDEK.Ciphertext) {
-		t.Fatal("metadata DEK was not rewrapped during KEK rotation")
-	}
-	var envelopeCount int
-	var envelopeRevision uint64
-	if err := service.vaultKeys.db.QueryRowContext(ctx, `
-SELECT COUNT(*), MIN(header_revision) FROM vault_key_envelopes`).Scan(
-		&envelopeCount, &envelopeRevision,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if envelopeCount != 1 || envelopeRevision != afterHeader.Revision {
-		t.Fatalf("wrapped vault DEKs = (%d at revision %d), want (1 at revision %d)", envelopeCount, envelopeRevision, afterHeader.Revision)
+	if bytes.Equal(afterSlot.Ciphertext, beforeSlot.Ciphertext) {
+		t.Fatal("vault DEK was not rewrapped during KEK rotation")
 	}
 	entry, err := service.Get(ctx, "rotation-test")
 	if err != nil || entry.Value.Fields[0].Value != "survives-kek-rotation" {
@@ -170,6 +163,75 @@ SELECT COUNT(*), MIN(header_revision) FROM vault_key_envelopes`).Scan(
 	entry, err = service.Get(ctx, "rotation-test")
 	if err != nil || entry.Value.Fields[0].Value != "survives-kek-rotation" {
 		t.Fatalf("read after unlocking rotated vault: entry=%+v err=%v", entry, err)
+	}
+}
+
+func TestMultipleCredentialSlotsUnlockTheSameVault(t *testing.T) {
+	ctx := context.Background()
+	firstAuth := &fakeAuthenticator{marker: 1}
+	secondAuth := &fakeAuthenticator{marker: 2}
+	service, _ := newTestVaultService(t, firstAuth)
+	devices := []hmacsecret.DeviceInfo{
+		{Path: "fake://first", Product: "First Key", Manufacturer: "Example"},
+		{Path: "fake://second", Product: "Second Key", Manufacturer: "Example"},
+	}
+	service.devices = func(hmacsecret.ListOptions) ([]hmacsecret.DeviceInfo, error) { return devices, nil }
+	service.open = func(path string) (fidoAuthenticator, error) {
+		if path == devices[0].Path {
+			return firstAuth, nil
+		}
+		if path == devices[1].Path {
+			return secondAuth, nil
+		}
+		return nil, errors.New("unknown authenticator")
+	}
+	if _, err := service.Initialize(ctx, devices[0].Path, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create(ctx, "shared", vaultValueDocument{
+		Version: vaultValueDocumentVersion,
+		Fields:  []vaultValueField{{Name: "secret", Value: "same-dek"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.AddCredentialSlot(ctx, devices[1].Path, "", "출장용 키")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RotateKEK(ctx, devices[0].Path, ""); err != nil {
+		t.Fatal(err)
+	}
+	slots, err := service.CredentialSlots(ctx)
+	if err != nil || len(slots) != 2 {
+		t.Fatalf("KEK rotation changed other credential slots: %+v, err=%v", slots, err)
+	}
+	service.Lock()
+	if _, err := service.Unlock(ctx, devices[1].Path, ""); err == nil {
+		t.Fatal("Unlock did not require a slot when multiple slots exist")
+	}
+	if _, err := service.UnlockSlot(ctx, second.ID, devices[0].Path, ""); err == nil {
+		t.Fatal("wrong authenticator unlocked the selected slot")
+	}
+	if _, err := service.UnlockSlot(ctx, second.ID, devices[1].Path, ""); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := service.Get(ctx, "shared")
+	if err != nil || entry.Value.Fields[0].Value != "same-dek" {
+		t.Fatalf("read through second credential slot: entry=%+v err=%v", entry, err)
+	}
+	if err := service.DeleteCredentialSlot(ctx, second.ID); err == nil {
+		t.Fatal("active credential slot was removed")
+	}
+	for _, slot := range slots {
+		if slot.ID != second.ID {
+			if err := service.DeleteCredentialSlot(ctx, slot.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	remaining, err := service.CredentialSlots(ctx)
+	if err != nil || len(remaining) != 1 || remaining[0].ID != second.ID || !remaining[0].Active {
+		t.Fatalf("remaining credential slot = %+v, err=%v", remaining, err)
 	}
 }
 
@@ -317,6 +379,13 @@ func TestRotateDEKReencryptsValuesWithoutFIDO(t *testing.T) {
 	if _, err := service.Initialize(ctx, "fake://security-key", ""); err != nil {
 		t.Fatal(err)
 	}
+	activeSlotID := service.activeSlotID
+	if _, err := service.AddCredentialSlot(ctx, "fake://security-key", "", "예비 보안 키"); err != nil {
+		t.Fatal(err)
+	}
+	if slots, err := service.CredentialSlots(ctx); err != nil || len(slots) != 2 {
+		t.Fatalf("credential slots before DEK rotation = %+v, err=%v", slots, err)
+	}
 
 	for i := range 12 {
 		alias := fmt.Sprintf("entry-%02d", i)
@@ -381,12 +450,16 @@ func TestRotateDEKReencryptsValuesWithoutFIDO(t *testing.T) {
 			t.Fatalf("temporary DEK rotation file remains: %s", filename)
 		}
 	}
-	staged, err := service.vaultKeys.hasStagedDEKRotation(ctx)
+	staged, err := service.vaultKeys.hasStagedCredentialSlotDEKRotation(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if staged {
 		t.Fatal("DEK rotation journal was not cleared")
+	}
+	slots, err := service.CredentialSlots(ctx)
+	if err != nil || len(slots) != 1 || slots[0].ID != activeSlotID || !slots[0].Active {
+		t.Fatalf("DEK rotation did not retain only the active slot: %+v, err=%v", slots, err)
 	}
 
 	service.Lock()
@@ -411,7 +484,7 @@ func TestInterruptedDEKSwapIsCompletedOnReopen(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	header, err := service.metadata.Header(ctx)
+	slot, err := service.vaultKeys.credentialSlot(ctx, service.activeSlotID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +503,7 @@ func TestInterruptedDEKSwapIsCompletedOnReopen(t *testing.T) {
 	if err := shadow.close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.vaultKeys.stageDEKRotation(ctx, header.Revision, header.KEK, newDEK, service.rootKEK); err != nil {
+	if err := service.vaultKeys.stageCredentialSlotDEKRotation(ctx, slot, newDEK, service.rootKEK); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.values.close(); err != nil {
@@ -453,7 +526,7 @@ func TestInterruptedDEKSwapIsCompletedOnReopen(t *testing.T) {
 	if fileExists(filepath.Join(dataDir, vaultValueBackupFilename)) {
 		t.Fatal("old vault database remains after recovery")
 	}
-	staged, err := service.vaultKeys.hasStagedDEKRotation(ctx)
+	staged, err := service.vaultKeys.hasStagedCredentialSlotDEKRotation(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +557,7 @@ func TestInterruptedDEKPreparationKeepsOriginalDatabase(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	header, err := service.metadata.Header(ctx)
+	slot, err := service.vaultKeys.credentialSlot(ctx, service.activeSlotID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -503,7 +576,7 @@ func TestInterruptedDEKPreparationKeepsOriginalDatabase(t *testing.T) {
 	if err := shadow.close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.vaultKeys.stageDEKRotation(ctx, header.Revision, header.KEK, newDEK, service.rootKEK); err != nil {
+	if err := service.vaultKeys.stageCredentialSlotDEKRotation(ctx, slot, newDEK, service.rootKEK); err != nil {
 		t.Fatal(err)
 	}
 
@@ -515,7 +588,7 @@ func TestInterruptedDEKPreparationKeepsOriginalDatabase(t *testing.T) {
 	if fileExists(shadowPath) {
 		t.Fatal("pre-swap shadow database remains after recovery")
 	}
-	staged, err := service.vaultKeys.hasStagedDEKRotation(ctx)
+	staged, err := service.vaultKeys.hasStagedCredentialSlotDEKRotation(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -601,17 +674,25 @@ func TestLegacyVaultDEKIsMigratedAfterFirstUnlock(t *testing.T) {
 	if credentials, derivations := auth.counts(); credentials != 2 || derivations != 4 {
 		t.Fatalf("migration unlock calls = (%d create, %d derive), want (2, 4)", credentials, derivations)
 	}
+	if err := service.metadata.Unlock(ctx, service.rootKEK); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := service.metadata.Get(ctx, vaultDEKAlias); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("legacy vault-DEK reference was not removed: %v", err)
 	}
+	service.metadata.Lock()
 	var envelopeCount int
 	if err := service.vaultKeys.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM vault_key_envelopes`,
 	).Scan(&envelopeCount); err != nil {
 		t.Fatal(err)
 	}
-	if envelopeCount != 1 {
-		t.Fatalf("wrapped vault DEK count = %d, want 1", envelopeCount)
+	if envelopeCount != 0 {
+		t.Fatalf("legacy wrapped vault DEK count = %d, want 0", envelopeCount)
+	}
+	slots, err := service.CredentialSlots(ctx)
+	if err != nil || len(slots) != 1 || !slots[0].Active {
+		t.Fatalf("migrated credential slots = %+v, err=%v", slots, err)
 	}
 	entry, err := service.Get(ctx, "legacy-entry")
 	if err != nil || entry.Value.Fields[0].Value != "migrated-secret" {

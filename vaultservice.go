@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,13 +57,14 @@ type fidoAuthenticator interface {
 type VaultService struct {
 	mu sync.Mutex
 
-	registry  *vaultRegistry
-	selected  vaultReference
-	metadata  *encryptedstore.Store
-	vaultKeys *vaultKeyEnvelopeStore
-	values    *vaultValueStore
-	rootKEK   *memguard.Enclave
-	vaultDEK  *memguard.Enclave
+	registry     *vaultRegistry
+	selected     vaultReference
+	metadata     *encryptedstore.Store
+	vaultKeys    *vaultKeyEnvelopeStore
+	values       *vaultValueStore
+	rootKEK      *memguard.Enclave
+	vaultDEK     *memguard.Enclave
+	activeSlotID string
 
 	devices  func(hmacsecret.ListOptions) ([]hmacsecret.DeviceInfo, error)
 	open     func(string) (fidoAuthenticator, error)
@@ -267,7 +269,20 @@ func (s *VaultService) statusLocked(ctx context.Context) (vaultStatus, error) {
 	if s.metadata == nil {
 		return vaultStatus{}, nil
 	}
-	_, err := s.metadata.Header(ctx)
+	slots, err := s.vaultKeys.credentialSlots(ctx)
+	if err != nil {
+		return vaultStatus{}, fmt.Errorf("read credential slots: %w", err)
+	}
+	if len(slots) > 0 {
+		return vaultStatus{
+			Initialized: true,
+			Unlocked:    s.vaultDEK != nil,
+			Selected:    true,
+			VaultName:   s.selected.Name,
+			VaultPath:   s.selected.Path,
+		}, nil
+	}
+	_, err = s.metadata.Header(ctx)
 	if errors.Is(err, store.ErrNotInitialized) {
 		return vaultStatus{
 			Selected:  true,
@@ -293,6 +308,13 @@ func (s *VaultService) Initialize(ctx context.Context, devicePath, pin string) (
 
 	if s.metadata == nil {
 		return vaultStatus{}, errors.New("select a vault before initializing")
+	}
+	slots, err := s.vaultKeys.credentialSlots(ctx)
+	if err != nil {
+		return vaultStatus{}, err
+	}
+	if len(slots) > 0 {
+		return vaultStatus{}, errors.New("vault is already initialized")
 	}
 	if _, err := s.metadata.Header(ctx); err == nil {
 		return vaultStatus{}, errors.New("vault is already initialized")
@@ -326,15 +348,13 @@ func (s *VaultService) Initialize(ctx context.Context, devicePath, pin string) (
 	if err != nil {
 		return vaultStatus{}, err
 	}
-	if err := s.vaultKeys.put(ctx, 1, rootRef, dek, rootKEK); err != nil {
-		return vaultStatus{}, fmt.Errorf("store wrapped vault DEK: %w", err)
-	}
-	if err := s.metadata.Initialize(ctx, rootRef, rootKEK); err != nil {
-		_ = s.vaultKeys.delete(context.Background(), 1)
-		return vaultStatus{}, fmt.Errorf("initialize encrypted key store: %w", err)
+	slot, err := s.vaultKeys.createCredentialSlot(ctx, defaultCredentialSlotLabel(device), rootRef, dek, rootKEK)
+	if err != nil {
+		return vaultStatus{}, fmt.Errorf("create initial credential slot: %w", err)
 	}
 	s.vaultDEK = dek
 	s.rootKEK = rootKEK
+	s.activeSlotID = slot.ID
 	if err := s.registry.rememberDevice(ctx, s.selected.Path, device); err != nil {
 		s.lockLocked()
 		return vaultStatus{}, err
@@ -353,6 +373,62 @@ func (s *VaultService) Unlock(ctx context.Context, devicePath, pin string) (vaul
 	if s.vaultDEK != nil {
 		return s.statusLocked(ctx)
 	}
+	slots, err := s.vaultKeys.credentialSlots(ctx)
+	if err != nil {
+		return vaultStatus{}, err
+	}
+	switch len(slots) {
+	case 0:
+		return s.unlockLegacyLocked(ctx, devicePath, pin)
+	case 1:
+		return s.unlockCredentialSlotLocked(ctx, slots[0].ID, devicePath, pin)
+	default:
+		return vaultStatus{}, errors.New("select a credential slot before unlocking")
+	}
+}
+
+func (s *VaultService) UnlockSlot(ctx context.Context, slotID, devicePath, pin string) (vaultStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.metadata == nil {
+		return vaultStatus{}, errors.New("select a vault before unlocking")
+	}
+	if s.vaultDEK != nil {
+		return s.statusLocked(ctx)
+	}
+	return s.unlockCredentialSlotLocked(ctx, slotID, devicePath, pin)
+}
+
+func (s *VaultService) unlockCredentialSlotLocked(ctx context.Context, slotID, devicePath, pin string) (vaultStatus, error) {
+	slot, err := s.vaultKeys.credentialSlot(ctx, slotID)
+	if err != nil {
+		return vaultStatus{}, err
+	}
+	auth, device, err := s.openAuthenticator(devicePath)
+	if err != nil {
+		return vaultStatus{}, err
+	}
+	rootKEK, err := s.derive(auth, pin, slot.Ref, "root-kek")
+	if err != nil {
+		return vaultStatus{}, err
+	}
+	dek, _, err := s.vaultKeys.openCredentialSlot(ctx, slotID, rootKEK)
+	if err != nil {
+		return vaultStatus{}, fmt.Errorf("unlock vault DEK: %w", err)
+	}
+	s.vaultDEK = dek
+	s.rootKEK = rootKEK
+	s.activeSlotID = slotID
+	_ = s.vaultKeys.touchCredentialSlot(ctx, slotID)
+	if err := s.registry.rememberDevice(ctx, s.selected.Path, device); err != nil {
+		s.lockLocked()
+		return vaultStatus{}, err
+	}
+	s.selected, _ = s.registry.get(ctx, s.selected.Path)
+	return s.statusLocked(ctx)
+}
+
+func (s *VaultService) unlockLegacyLocked(ctx context.Context, devicePath, pin string) (vaultStatus, error) {
 	header, err := s.metadata.Header(ctx)
 	if errors.Is(err, store.ErrNotInitialized) {
 		return vaultStatus{}, errors.New("vault is not initialized")
@@ -401,8 +477,16 @@ func (s *VaultService) Unlock(ctx context.Context, devicePath, pin string) (vaul
 		return vaultStatus{}, fmt.Errorf("unlock vault DEK: %w", err)
 	}
 	_ = s.vaultKeys.deleteExcept(ctx, header.Revision)
+	slot, err := s.vaultKeys.createCredentialSlot(ctx, defaultCredentialSlotLabel(device), header.KEK, dek, rootKEK)
+	if err != nil {
+		s.metadata.Lock()
+		return vaultStatus{}, fmt.Errorf("migrate credential slot: %w", err)
+	}
 	s.vaultDEK = dek
 	s.rootKEK = rootKEK
+	s.activeSlotID = slot.ID
+	_ = s.vaultKeys.delete(ctx, header.Revision)
+	s.metadata.Lock()
 	if err := s.registry.rememberDevice(ctx, s.selected.Path, device); err != nil {
 		s.lockLocked()
 		return vaultStatus{}, err
@@ -411,10 +495,87 @@ func (s *VaultService) Unlock(ctx context.Context, devicePath, pin string) (vaul
 	return s.statusLocked(ctx)
 }
 
-// RotateKEK replaces the public root credential reference and rewraps the
-// metadata-store DEK without rewriting the encrypted vault metadata or values.
-// The vault must already be unlocked so the existing metadata-store DEK is
-// available for rewrapping.
+func (s *VaultService) CredentialSlots(ctx context.Context) ([]CredentialSlotInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.vaultKeys == nil {
+		return []CredentialSlotInfo{}, nil
+	}
+	slots, err := s.vaultKeys.credentialSlots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for index := range slots {
+		slots[index].Active = slots[index].ID == s.activeSlotID
+	}
+	return slots, nil
+}
+
+func (s *VaultService) AddCredentialSlot(ctx context.Context, devicePath, pin, label string) (CredentialSlotInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.vaultKeys == nil {
+		return CredentialSlotInfo{}, errors.New("select a vault before adding a device")
+	}
+	if s.vaultDEK == nil {
+		return CredentialSlotInfo{}, errors.New("vault is locked")
+	}
+	auth, device, err := s.openAuthenticator(devicePath)
+	if err != nil {
+		return CredentialSlotInfo{}, err
+	}
+	if label = strings.TrimSpace(label); label == "" {
+		label = defaultCredentialSlotLabel(device)
+	}
+	salt := make([]byte, store.SaltSize)
+	if _, err := rand.Read(salt); err != nil {
+		return CredentialSlotInfo{}, fmt.Errorf("generate credential slot salt: %w", err)
+	}
+	credential, err := s.createCredential(auth, pin, "credential-slot")
+	if err != nil {
+		return CredentialSlotInfo{}, err
+	}
+	ref := store.KEKReference{CredentialID: credential.ID, Salt: salt, RPID: vaultRPID}
+	kek, err := s.derive(auth, pin, ref, "credential-slot")
+	if err != nil {
+		return CredentialSlotInfo{}, err
+	}
+	info, err := s.vaultKeys.createCredentialSlot(ctx, label, ref, s.vaultDEK, kek)
+	if err != nil {
+		return CredentialSlotInfo{}, fmt.Errorf("add credential slot: %w", err)
+	}
+	if err := s.registry.rememberDevice(ctx, s.selected.Path, device); err != nil {
+		_ = s.vaultKeys.deleteCredentialSlot(context.Background(), info.ID)
+		return CredentialSlotInfo{}, err
+	}
+	s.selected, _ = s.registry.get(ctx, s.selected.Path)
+	return info, nil
+}
+
+func (s *VaultService) DeleteCredentialSlot(ctx context.Context, slotID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.vaultKeys == nil {
+		return errors.New("select a vault before removing a device")
+	}
+	if s.vaultDEK == nil {
+		return errors.New("vault is locked")
+	}
+	if slotID == s.activeSlotID {
+		return errors.New("the active credential slot cannot be removed")
+	}
+	slots, err := s.vaultKeys.credentialSlots(ctx)
+	if err != nil {
+		return err
+	}
+	if len(slots) <= 1 {
+		return errors.New("the last credential slot cannot be removed")
+	}
+	return s.vaultKeys.deleteCredentialSlot(ctx, slotID)
+}
+
+// RotateKEK replaces the active slot's credential and rewraps the same vault
+// DEK. Other credential slots remain valid.
 func (s *VaultService) RotateKEK(ctx context.Context, devicePath, pin string) (vaultStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -422,15 +583,8 @@ func (s *VaultService) RotateKEK(ctx context.Context, devicePath, pin string) (v
 	if s.metadata == nil {
 		return vaultStatus{}, errors.New("select a vault before rotating its KEK")
 	}
-	if s.vaultDEK == nil {
+	if s.vaultDEK == nil || s.activeSlotID == "" {
 		return vaultStatus{}, errors.New("vault is locked")
-	}
-	header, err := s.metadata.Header(ctx)
-	if err != nil {
-		return vaultStatus{}, fmt.Errorf("load vault header before KEK rotation: %w", err)
-	}
-	if header.Revision == ^uint64(0) {
-		return vaultStatus{}, errors.New("vault KEK revision is exhausted")
 	}
 
 	auth, device, err := s.openAuthenticator(devicePath)
@@ -454,11 +608,6 @@ func (s *VaultService) RotateKEK(ctx context.Context, devicePath, pin string) (v
 	if err != nil {
 		return vaultStatus{}, err
 	}
-	nextRevision := header.Revision + 1
-	if err := s.vaultKeys.put(ctx, nextRevision, nextRef, s.vaultDEK, nextKEK); err != nil {
-		return vaultStatus{}, fmt.Errorf("stage wrapped vault DEK for KEK rotation: %w", err)
-	}
-
 	previousDevice := authenticatorInfo{
 		Path:         s.selected.PreferredDevicePath,
 		Product:      s.selected.PreferredDeviceProduct,
@@ -467,15 +616,12 @@ func (s *VaultService) RotateKEK(ctx context.Context, devicePath, pin string) (v
 		ProductID:    s.selected.PreferredDeviceProductID,
 	}
 	if err := s.registry.rememberDevice(ctx, s.selected.Path, device); err != nil {
-		_ = s.vaultKeys.delete(context.Background(), nextRevision)
 		return vaultStatus{}, err
 	}
-	if err := s.metadata.RotateKEK(ctx, nextRef, nextKEK); err != nil {
-		_ = s.vaultKeys.delete(context.Background(), nextRevision)
+	if err := s.vaultKeys.replaceCredentialSlot(ctx, s.activeSlotID, nextRef, s.vaultDEK, nextKEK); err != nil {
 		_ = s.registry.rememberDevice(context.Background(), s.selected.Path, previousDevice)
 		return vaultStatus{}, fmt.Errorf("rotate vault KEK: %w", err)
 	}
-	_ = s.vaultKeys.deleteExcept(ctx, nextRevision)
 	s.rootKEK = nextKEK
 
 	s.selected.PreferredDevicePath = device.Path
@@ -656,6 +802,7 @@ func (s *VaultService) lockLocked() {
 	}
 	s.vaultDEK = nil
 	s.rootKEK = nil
+	s.activeSlotID = ""
 	memguard.Purge()
 }
 

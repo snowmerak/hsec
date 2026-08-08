@@ -5,3 +5,7 @@ import * as VaultService from "./vaultservice.js";
 export {
     VaultService
 };
+
+export type {
+    CredentialSlotInfo
+} from "./models.js";

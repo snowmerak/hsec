@@ -35,18 +35,22 @@ func (s *VaultService) RotateDEK(ctx context.Context) (vaultStatus, error) {
 	if s.metadata == nil || s.values == nil || s.vaultKeys == nil {
 		return vaultStatus{}, errors.New("select a vault before rotating its DEK")
 	}
-	if s.vaultDEK == nil || s.rootKEK == nil {
+	if s.vaultDEK == nil || s.rootKEK == nil || s.activeSlotID == "" {
 		return vaultStatus{}, errors.New("vault is locked")
 	}
-	header, err := s.metadata.Header(ctx)
+	slot, err := s.vaultKeys.credentialSlot(ctx, s.activeSlotID)
 	if err != nil {
-		return vaultStatus{}, fmt.Errorf("load vault header before DEK rotation: %w", err)
+		return vaultStatus{}, fmt.Errorf("load active credential slot before DEK rotation: %w", err)
 	}
-	staged, err := s.vaultKeys.hasStagedDEKRotation(ctx)
+	staged, err := s.vaultKeys.hasStagedCredentialSlotDEKRotation(ctx)
 	if err != nil {
 		return vaultStatus{}, err
 	}
-	if staged {
+	legacyStaged, err := s.vaultKeys.hasStagedDEKRotation(ctx)
+	if err != nil {
+		return vaultStatus{}, err
+	}
+	if staged || legacyStaged {
 		return vaultStatus{}, errors.New("an interrupted DEK rotation must be recovered by reopening the vault")
 	}
 
@@ -84,12 +88,12 @@ func (s *VaultService) RotateDEK(ctx context.Context) (vaultStatus, error) {
 	}
 	_ = os.Chmod(shadowPath, 0o600)
 
-	if err := s.vaultKeys.stageDEKRotation(ctx, header.Revision, header.KEK, newDEK, s.rootKEK); err != nil {
+	if err := s.vaultKeys.stageCredentialSlotDEKRotation(ctx, slot, newDEK, s.rootKEK); err != nil {
 		_ = removeFileIfExists(shadowPath)
 		return vaultStatus{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		_ = s.vaultKeys.clearStagedDEKRotation(context.Background())
+		_ = s.vaultKeys.clearStagedCredentialSlotDEKRotation(context.Background())
 		_ = removeFileIfExists(shadowPath)
 		return vaultStatus{}, err
 	}
@@ -97,7 +101,7 @@ func (s *VaultService) RotateDEK(ctx context.Context) (vaultStatus, error) {
 	s.emitDEKRotationProgress("switching", total, total, "완성된 데이터베이스로 전환하고 있습니다.")
 	if err := s.values.close(); err != nil {
 		s.values = nil
-		_ = s.vaultKeys.clearStagedDEKRotation(context.Background())
+		_ = s.vaultKeys.clearStagedCredentialSlotDEKRotation(context.Background())
 		_ = removeFileIfExists(shadowPath)
 		reopenErr := s.reopenVaultValuesAfterRotationFailure(dataDir)
 		return vaultStatus{}, errors.Join(fmt.Errorf("close current vault database: %w", err), reopenErr)
@@ -105,17 +109,17 @@ func (s *VaultService) RotateDEK(ctx context.Context) (vaultStatus, error) {
 	s.values = nil
 
 	if err := swapVaultValueFiles(dataDir); err != nil {
-		_ = s.vaultKeys.clearStagedDEKRotation(context.Background())
+		_ = s.vaultKeys.clearStagedCredentialSlotDEKRotation(context.Background())
 		recoveryErr := recoverUncommittedDEKSwap(dataDir)
 		reopenErr := s.reopenVaultValuesAfterRotationFailure(dataDir)
 		return vaultStatus{}, errors.Join(err, recoveryErr, reopenErr)
 	}
 
-	if err := s.vaultKeys.promoteStagedDEKRotation(context.Background()); err != nil {
+	if err := s.vaultKeys.promoteStagedCredentialSlotDEKRotation(context.Background()); err != nil {
 		rollbackErr := rollbackVaultValueSwap(dataDir)
 		var reopenErr error
 		if rollbackErr == nil {
-			_ = s.vaultKeys.clearStagedDEKRotation(context.Background())
+			_ = s.vaultKeys.clearStagedCredentialSlotDEKRotation(context.Background())
 			reopenErr = s.reopenVaultValuesAfterRotationFailure(dataDir)
 		} else {
 			s.lockLocked()
@@ -255,9 +259,23 @@ func recoverDEKRotationFiles(dataDir string, keys *vaultKeyEnvelopeStore) error 
 	shadowPath := filepath.Join(dataDir, vaultValueShadowFilename)
 	backupPath := filepath.Join(dataDir, vaultValueBackupFilename)
 	live, shadow, backup := fileExists(livePath), fileExists(shadowPath), fileExists(backupPath)
-	staged, err := keys.hasStagedDEKRotation(ctx)
+	slotStaged, err := keys.hasStagedCredentialSlotDEKRotation(ctx)
 	if err != nil {
 		return err
+	}
+	legacyStaged, err := keys.hasStagedDEKRotation(ctx)
+	if err != nil {
+		return err
+	}
+	if slotStaged && legacyStaged {
+		return errors.New("vault has conflicting interrupted DEK rotations")
+	}
+	staged := slotStaged || legacyStaged
+	promote := keys.promoteStagedCredentialSlotDEKRotation
+	clear := keys.clearStagedCredentialSlotDEKRotation
+	if legacyStaged {
+		promote = keys.promoteStagedDEKRotation
+		clear = keys.clearStagedDEKRotation
 	}
 
 	if !staged {
@@ -287,7 +305,7 @@ func recoverDEKRotationFiles(dataDir string, keys *vaultKeyEnvelopeStore) error 
 	case live && backup && !shadow:
 		// Both file renames completed. Committing the staged wrapper makes the
 		// already-complete shadow database authoritative.
-		if err := keys.promoteStagedDEKRotation(ctx); err != nil {
+		if err := promote(ctx); err != nil {
 			return err
 		}
 		_ = removeFileIfExists(backupPath)
@@ -298,11 +316,11 @@ func recoverDEKRotationFiles(dataDir string, keys *vaultKeyEnvelopeStore) error 
 			return fmt.Errorf("roll back interrupted DEK rotation: %w", err)
 		}
 		_ = removeFileIfExists(shadowPath)
-		return keys.clearStagedDEKRotation(ctx)
+		return clear(ctx)
 	case live && !backup:
 		// The swap did not start. The live database still uses the old DEK.
 		_ = removeFileIfExists(shadowPath)
-		return keys.clearStagedDEKRotation(ctx)
+		return clear(ctx)
 	default:
 		return errors.New("vault has an unrecognized interrupted DEK rotation state")
 	}

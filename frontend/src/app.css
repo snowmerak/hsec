@@ -758,6 +758,50 @@ button:disabled {
   grid-column: auto;
 }
 
+.device-manager-dialog {
+  width: min(620px, 100%);
+}
+
+.credential-slot-section,
+.credential-add-form {
+  display: grid;
+  gap: 10px;
+}
+
+.credential-add-form {
+  padding-top: 16px;
+  border-top: 1px solid var(--mp-border-subtle);
+}
+
+.credential-slot-list {
+  display: grid;
+  gap: 7px;
+}
+
+.credential-slot-row {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: var(--mp-bg-inset);
+}
+
+.slot-badge {
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: var(--mp-accent-200);
+  background: color-mix(in srgb, var(--mp-accent-500) 18%, transparent);
+  font-size: 0.7rem;
+  font-weight: 700;
+}
+
+.compact-authenticator-list {
+  max-height: 190px;
+  overflow: auto;
+}
+
 .dek-rotation-dialog {
   width: min(500px, 100%);
 }

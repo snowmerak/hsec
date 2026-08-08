@@ -70,7 +70,7 @@ CREATE TABLE IF NOT EXISTS vault_dek_rotation (
 	if err != nil {
 		return fmt.Errorf("migrate vault key envelope store: %w", err)
 	}
-	return nil
+	return s.migrateCredentialSlots(ctx)
 }
 
 func (s *vaultKeyEnvelopeStore) stageDEKRotation(

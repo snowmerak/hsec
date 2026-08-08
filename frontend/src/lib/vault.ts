@@ -27,6 +27,13 @@ export type AuthenticatorInfo = {
   vendorId: number;
   windowsHello: boolean;
 };
+export type CredentialSlot = {
+  id: string;
+  label: string;
+  createdAt: string;
+  lastUsedAt: string;
+  active: boolean;
+};
 export type VaultValueField = {name: string; value: string};
 export type VaultValueDocument = {version: number; fields: VaultValueField[]};
 export type VaultEntry = {
@@ -49,8 +56,12 @@ export interface VaultAPI {
   SelectVault(path: string): Promise<VaultStatus>;
   CloseVault(): Promise<VaultStatus>;
   Authenticators(): Promise<AuthenticatorInfo[]>;
+  CredentialSlots(): Promise<CredentialSlot[]>;
   Initialize(devicePath: string, pin: string): Promise<VaultStatus>;
   Unlock(devicePath: string, pin: string): Promise<VaultStatus>;
+  UnlockSlot(slotId: string, devicePath: string, pin: string): Promise<VaultStatus>;
+  AddCredentialSlot(devicePath: string, pin: string, label: string): Promise<CredentialSlot>;
+  DeleteCredentialSlot(slotId: string): Promise<void>;
   RotateKEK(devicePath: string, pin: string): Promise<VaultStatus>;
   RotateDEK(): Promise<VaultStatus>;
   Lock(): Promise<VaultStatus>;
@@ -67,6 +78,7 @@ const personalPath = "/Users/example/Google Drive/My Drive/Vaults/personal";
 const workPath = "/Users/example/Vaults/work";
 let mockSelectedPath = previewMode === "launcher" ? "" : personalPath;
 let mockUnlocked = previewMode === "unlocked";
+let mockActiveSlotId = mockUnlocked ? "personal-main" : "";
 let mockReferences: VaultReference[] = [
   {
     name: "personal",
@@ -99,6 +111,13 @@ const mockAuthenticators: AuthenticatorInfo[] = [
   {index: 0, path: "fido://yubikey-5", product: "YubiKey 5 NFC", manufacturer: "Yubico", vendorId: 0x1050, productId: 0x0407, windowsHello: false},
   {index: 1, path: "fido://solo-v2", product: "SoloKey v2", manufacturer: "SoloKeys", vendorId: 0x1209, productId: 0x5070, windowsHello: false},
 ];
+const mockCredentialSlots = new Map<string, CredentialSlot[]>([
+  [personalPath, [
+    {id: "personal-main", label: "Yubico YubiKey 5 NFC", createdAt: now, lastUsedAt: now, active: false},
+    {id: "personal-backup", label: "Windows Hello", createdAt: now, lastUsedAt: now, active: false},
+  ]],
+  [workPath, [{id: "work-main", label: "SoloKeys SoloKey v2", createdAt: now, lastUsedAt: now, active: false}]],
+]);
 let mockEntries: VaultEntry[] = [
   {alias: "개인 vault", value: {version: 1, fields: [{name: "사용자 이름", value: "snowmerak"}, {name: "비밀번호", value: "correct-horse-battery-staple"}, {name: "메모", value: "개인 계정"}]}, revision: 1, createdAt: now, updatedAt: now},
   {alias: "GitHub", value: {version: 1, fields: [{name: "사용자 이름", value: "snowmerak"}, {name: "API 토큰", value: "ghp_example_only"}]}, revision: 1, createdAt: now, updatedAt: now},
@@ -147,19 +166,28 @@ const mockVault: VaultAPI = {
     if (!mockReferences.some((item) => item.path === path)) throw new Error("vault reference not found");
     mockSelectedPath = path;
     mockUnlocked = false;
+    mockActiveSlotId = "";
     return mockStatus();
   },
   async CloseVault() {
     mockSelectedPath = "";
     mockUnlocked = false;
+    mockActiveSlotId = "";
     return mockStatus();
   },
   async Authenticators() {
     return mockAuthenticators.map((device) => ({...device}));
   },
+  async CredentialSlots() {
+    return (mockCredentialSlots.get(mockSelectedPath) ?? []).map((slot) => ({...slot, active: slot.id === mockActiveSlotId}));
+  },
   async Initialize(devicePath) {
-    if (!mockSelectedPath || !mockAuthenticators.some((device) => device.path === devicePath)) throw new Error("select a FIDO2 security key");
+    const device = mockAuthenticators.find((item) => item.path === devicePath);
+    if (!mockSelectedPath || !device) throw new Error("select a FIDO2 security key");
     mockInitialized.set(mockSelectedPath, true);
+    const slot = {id: `slot-${Date.now()}`, label: defaultDeviceLabel(device), createdAt: now, lastUsedAt: now, active: true};
+    mockCredentialSlots.set(mockSelectedPath, [slot]);
+    mockActiveSlotId = slot.id;
     mockUnlocked = true;
     return mockStatus();
   },
@@ -167,6 +195,29 @@ const mockVault: VaultAPI = {
     if (!mockAuthenticators.some((device) => device.path === devicePath)) throw new Error("select a FIDO2 security key");
     mockUnlocked = true;
     return mockStatus();
+  },
+  async UnlockSlot(slotId, devicePath) {
+    if (!mockAuthenticators.some((device) => device.path === devicePath)) throw new Error("select a FIDO2 security key");
+    if (!(mockCredentialSlots.get(mockSelectedPath) ?? []).some((slot) => slot.id === slotId)) throw new Error("credential slot not found");
+    mockActiveSlotId = slotId;
+    mockUnlocked = true;
+    return mockStatus();
+  },
+  async AddCredentialSlot(devicePath, _pin, label) {
+    if (!mockUnlocked) throw new Error("vault is locked");
+    const device = mockAuthenticators.find((item) => item.path === devicePath);
+    if (!device) throw new Error("select a FIDO2 security key");
+    const slots = mockCredentialSlots.get(mockSelectedPath) ?? [];
+    const resolvedLabel = label.trim() || defaultDeviceLabel(device);
+    if (slots.some((slot) => slot.label.toLocaleLowerCase() === resolvedLabel.toLocaleLowerCase())) throw new Error("credential slot label is already in use");
+    const slot = {id: `slot-${Date.now()}`, label: resolvedLabel, createdAt: new Date().toISOString(), lastUsedAt: "", active: false};
+    mockCredentialSlots.set(mockSelectedPath, [...slots, slot]);
+    return {...slot};
+  },
+  async DeleteCredentialSlot(slotId) {
+    if (slotId === mockActiveSlotId) throw new Error("the active credential slot cannot be removed");
+    const slots = mockCredentialSlots.get(mockSelectedPath) ?? [];
+    mockCredentialSlots.set(mockSelectedPath, slots.filter((slot) => slot.id !== slotId));
   },
   async RotateKEK(devicePath) {
     if (!mockUnlocked) throw new Error("vault is locked");
@@ -184,10 +235,12 @@ const mockVault: VaultAPI = {
   },
   async RotateDEK() {
     if (!mockUnlocked) throw new Error("vault is locked");
+    mockCredentialSlots.set(mockSelectedPath, (mockCredentialSlots.get(mockSelectedPath) ?? []).filter((slot) => slot.id === mockActiveSlotId));
     return mockStatus();
   },
   async Lock() {
     mockUnlocked = false;
+    mockActiveSlotId = "";
     return mockStatus();
   },
   async List() {
@@ -252,11 +305,23 @@ const wailsVault: VaultAPI = {
   async Authenticators() {
     return (await WailsVault.Authenticators()) ?? [];
   },
+  async CredentialSlots() {
+    return (await WailsVault.CredentialSlots()) ?? [];
+  },
   async Initialize(devicePath, pin) {
     return WailsVault.Initialize(devicePath, pin);
   },
   async Unlock(devicePath, pin) {
     return WailsVault.Unlock(devicePath, pin);
+  },
+  async UnlockSlot(slotId, devicePath, pin) {
+    return WailsVault.UnlockSlot(slotId, devicePath, pin);
+  },
+  async AddCredentialSlot(devicePath, pin, label) {
+    return WailsVault.AddCredentialSlot(devicePath, pin, label);
+  },
+  async DeleteCredentialSlot(slotId) {
+    return WailsVault.DeleteCredentialSlot(slotId);
   },
   async RotateKEK(devicePath, pin) {
     return WailsVault.RotateKEK(devicePath, pin);
@@ -286,3 +351,13 @@ const wailsVault: VaultAPI = {
 
 export const isPreview = previewMode !== null;
 export const vault: VaultAPI = isPreview ? mockVault : wailsVault;
+
+export function defaultDeviceLabel(device: AuthenticatorInfo) {
+  const product = device.product.trim();
+  const manufacturer = device.manufacturer.trim();
+  if (device.windowsHello && product) return product;
+  if (product && manufacturer && !product.toLocaleLowerCase().includes(manufacturer.toLocaleLowerCase())) return `${manufacturer} ${product}`;
+  if (product) return product;
+  if (manufacturer) return `${manufacturer} FIDO2`;
+  return "FIDO2 보안 키";
+}
