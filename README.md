@@ -17,14 +17,18 @@ interface.
 - Each user-selected vault folder contains its own `keys.sqlite` and
   `vault.sqlite`. The folder can be inside a locally synchronized directory
   such as Google Drive or iCloud Drive.
-- `keys.sqlite` stores the public root KEK reference and the encrypted
-  credential ID and salt for the `vault-dek` credential.
+- `keys.sqlite` stores the public root KEK reference and a random vault DEK
+  wrapped with that KEK. The vault DEK does not have its own FIDO credential.
 - `vault.sqlite` stores the human-readable alias as its exact primary key and an
   XChaCha20-Poly1305 encrypted, versioned field document. Field names and values
   are encrypted together as one atomic payload.
-- The root KEK is derived only while initializing or unlocking the metadata
-  store. The vault DEK remains sealed in a `memguard.Enclave` until the vault is
-  locked.
+- Initializing a vault performs exactly one FIDO credential creation and one
+  HMAC-secret derivation. Unlocking performs one derivation. The unwrapped vault
+  DEK remains sealed in a `memguard.Enclave` until the vault is locked.
+- KEK rotation creates and derives one replacement root credential, then
+  rewraps both the metadata-store DEK and vault DEK without rewriting encrypted
+  values. Vaults from the older two-credential format migrate their vault DEK
+  on the first successful unlock.
 - FIDO operations are serialized. If a create or derive operation takes longer
   than one second, the UI shows a persistent security-key touch prompt until the
   operation finishes.

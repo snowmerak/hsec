@@ -56,11 +56,12 @@ type fidoAuthenticator interface {
 type VaultService struct {
 	mu sync.Mutex
 
-	registry *vaultRegistry
-	selected vaultReference
-	metadata *encryptedstore.Store
-	values   *vaultValueStore
-	vaultDEK *memguard.Enclave
+	registry  *vaultRegistry
+	selected  vaultReference
+	metadata  *encryptedstore.Store
+	vaultKeys *vaultKeyEnvelopeStore
+	values    *vaultValueStore
+	vaultDEK  *memguard.Enclave
 
 	devices  func(hmacsecret.ListOptions) ([]hmacsecret.DeviceInfo, error)
 	open     func(string) (fidoAuthenticator, error)
@@ -102,28 +103,35 @@ func NewVaultService(appDataDir string) (*VaultService, error) {
 	}, nil
 }
 
-func openVaultStores(dataDir string) (*encryptedstore.Store, *vaultValueStore, error) {
+func openVaultStores(dataDir string) (*encryptedstore.Store, *vaultKeyEnvelopeStore, *vaultValueStore, error) {
 	if err := validateVaultDirectory(dataDir); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	backend, err := sqlitestore.Open(filepath.Join(dataDir, "keys.sqlite"))
+	keysPath := filepath.Join(dataDir, "keys.sqlite")
+	backend, err := sqlitestore.Open(keysPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	metadata, err := encryptedstore.New(backend)
 	if err != nil {
 		_ = backend.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+	vaultKeys, err := openVaultKeyEnvelopeStore(keysPath)
+	if err != nil {
+		_ = metadata.Close()
+		return nil, nil, nil, err
 	}
 	values, err := openVaultValueStore(filepath.Join(dataDir, "vault.sqlite"))
 	if err != nil {
+		_ = vaultKeys.close()
 		_ = metadata.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	for _, filename := range []string{"keys.sqlite", "vault.sqlite"} {
 		_ = os.Chmod(filepath.Join(dataDir, filename), 0o600)
 	}
-	return metadata, values, nil
+	return metadata, vaultKeys, values, nil
 }
 
 func defaultVaultDataDir() (string, error) {
@@ -136,17 +144,21 @@ func defaultVaultDataDir() (string, error) {
 
 func (s *VaultService) closeSelectedLocked() error {
 	s.lockLocked()
-	var valueErr, metadataErr error
+	var valueErr, vaultKeyErr, metadataErr error
 	if s.values != nil {
 		valueErr = s.values.close()
+	}
+	if s.vaultKeys != nil {
+		vaultKeyErr = s.vaultKeys.close()
 	}
 	if s.metadata != nil {
 		metadataErr = s.metadata.Close()
 	}
 	s.values = nil
+	s.vaultKeys = nil
 	s.metadata = nil
 	s.selected = vaultReference{}
-	return errors.Join(valueErr, metadataErr)
+	return errors.Join(valueErr, vaultKeyErr, metadataErr)
 }
 
 func (s *VaultService) setEmitter(emit func(string, any)) {
@@ -206,11 +218,12 @@ func (s *VaultService) SelectVault(ctx context.Context, path string) (vaultStatu
 	if err := s.closeSelectedLocked(); err != nil {
 		return vaultStatus{}, err
 	}
-	metadata, values, err := openVaultStores(ref.Path)
+	metadata, vaultKeys, values, err := openVaultStores(ref.Path)
 	if err != nil {
 		return vaultStatus{}, err
 	}
 	s.metadata = metadata
+	s.vaultKeys = vaultKeys
 	s.values = values
 	s.selected = ref
 	if err := s.registry.touch(ctx, ref.Path); err != nil {
@@ -293,29 +306,26 @@ func (s *VaultService) Initialize(ctx context.Context, devicePath, pin string) (
 	if err != nil {
 		return vaultStatus{}, err
 	}
-	rootKEK, err := s.derive(auth, pin, store.KEKReference{
+	rootRef := store.KEKReference{
 		CredentialID: rootCredential.ID,
 		Salt:         rootSalt,
 		RPID:         vaultRPID,
-	}, "root-kek")
+	}
+	rootKEK, err := s.derive(auth, pin, rootRef, "root-kek")
 	if err != nil {
 		return vaultStatus{}, err
 	}
 
-	dekRecord, dek, err := s.provisionVaultDEK(auth, pin)
+	dek, err := randomVaultKey()
 	if err != nil {
 		return vaultStatus{}, err
 	}
-	if err := s.metadata.Initialize(ctx, store.KEKReference{
-		CredentialID: rootCredential.ID,
-		Salt:         rootSalt,
-		RPID:         vaultRPID,
-	}, rootKEK); err != nil {
-		return vaultStatus{}, fmt.Errorf("initialize encrypted key store: %w", err)
+	if err := s.vaultKeys.put(ctx, 1, rootRef, dek, rootKEK); err != nil {
+		return vaultStatus{}, fmt.Errorf("store wrapped vault DEK: %w", err)
 	}
-	if err := s.metadata.Put(ctx, dekRecord); err != nil {
-		s.metadata.Lock()
-		return vaultStatus{}, fmt.Errorf("store encrypted vault DEK reference: %w", err)
+	if err := s.metadata.Initialize(ctx, rootRef, rootKEK); err != nil {
+		_ = s.vaultKeys.delete(context.Background(), 1)
+		return vaultStatus{}, fmt.Errorf("initialize encrypted key store: %w", err)
 	}
 	s.vaultDEK = dek
 	if err := s.registry.rememberDevice(ctx, s.selected.Path, device); err != nil {
@@ -356,20 +366,34 @@ func (s *VaultService) Unlock(ctx context.Context, devicePath, pin string) (vaul
 		return vaultStatus{}, fmt.Errorf("unlock encrypted key store: %w", err)
 	}
 
-	record, err := s.metadata.Get(ctx, vaultDEKAlias)
+	dek, err := s.vaultKeys.get(ctx, header.Revision, header.KEK, rootKEK)
+	if errors.Is(err, errVaultKeyEnvelopeNotFound) {
+		// Vaults created before the wrapped-DEK format stored a second FIDO
+		// credential. Migrate that DEK once; later unlocks need only root KEK.
+		record, getErr := s.metadata.Get(ctx, vaultDEKAlias)
+		if getErr != nil {
+			s.metadata.Lock()
+			return vaultStatus{}, fmt.Errorf("load wrapped or legacy vault DEK: %w", getErr)
+		}
+		dek, err = s.derive(auth, pin, store.KEKReference{
+			CredentialID: record.CredentialID,
+			Salt:         record.Salt,
+			RPID:         record.RPID,
+		}, "vault-dek-migration")
+		if err == nil {
+			err = s.vaultKeys.put(ctx, header.Revision, header.KEK, dek, rootKEK)
+		}
+		if err == nil {
+			// The envelope is durable before the legacy reference is removed.
+			// Failure to remove it is harmless and can be retried later.
+			_ = s.metadata.Delete(ctx, vaultDEKAlias)
+		}
+	}
 	if err != nil {
 		s.metadata.Lock()
-		return vaultStatus{}, fmt.Errorf("load vault DEK reference: %w", err)
+		return vaultStatus{}, fmt.Errorf("unlock vault DEK: %w", err)
 	}
-	dek, err := s.derive(auth, pin, store.KEKReference{
-		CredentialID: record.CredentialID,
-		Salt:         record.Salt,
-		RPID:         record.RPID,
-	}, "vault-dek")
-	if err != nil {
-		s.metadata.Lock()
-		return vaultStatus{}, err
-	}
+	_ = s.vaultKeys.deleteExcept(ctx, header.Revision)
 	s.vaultDEK = dek
 	if err := s.registry.rememberDevice(ctx, s.selected.Path, device); err != nil {
 		s.lockLocked()
@@ -393,21 +417,17 @@ func (s *VaultService) RotateKEK(ctx context.Context, devicePath, pin string) (v
 	if s.vaultDEK == nil {
 		return vaultStatus{}, errors.New("vault is locked")
 	}
+	header, err := s.metadata.Header(ctx)
+	if err != nil {
+		return vaultStatus{}, fmt.Errorf("load vault header before KEK rotation: %w", err)
+	}
+	if header.Revision == ^uint64(0) {
+		return vaultStatus{}, errors.New("vault KEK revision is exhausted")
+	}
 
 	auth, device, err := s.openAuthenticator(devicePath)
 	if err != nil {
 		return vaultStatus{}, err
-	}
-	dekRecord, err := s.metadata.Get(ctx, vaultDEKAlias)
-	if err != nil {
-		return vaultStatus{}, fmt.Errorf("load vault DEK reference before KEK rotation: %w", err)
-	}
-	if _, err := s.derive(auth, pin, store.KEKReference{
-		CredentialID: dekRecord.CredentialID,
-		Salt:         dekRecord.Salt,
-		RPID:         dekRecord.RPID,
-	}, "vault-dek-validation"); err != nil {
-		return vaultStatus{}, fmt.Errorf("selected authenticator cannot derive the current vault DEK: %w", err)
 	}
 	salt := make([]byte, store.SaltSize)
 	if _, err := rand.Read(salt); err != nil {
@@ -426,6 +446,10 @@ func (s *VaultService) RotateKEK(ctx context.Context, devicePath, pin string) (v
 	if err != nil {
 		return vaultStatus{}, err
 	}
+	nextRevision := header.Revision + 1
+	if err := s.vaultKeys.put(ctx, nextRevision, nextRef, s.vaultDEK, nextKEK); err != nil {
+		return vaultStatus{}, fmt.Errorf("stage wrapped vault DEK for KEK rotation: %w", err)
+	}
 
 	previousDevice := authenticatorInfo{
 		Path:         s.selected.PreferredDevicePath,
@@ -435,12 +459,15 @@ func (s *VaultService) RotateKEK(ctx context.Context, devicePath, pin string) (v
 		ProductID:    s.selected.PreferredDeviceProductID,
 	}
 	if err := s.registry.rememberDevice(ctx, s.selected.Path, device); err != nil {
+		_ = s.vaultKeys.delete(context.Background(), nextRevision)
 		return vaultStatus{}, err
 	}
 	if err := s.metadata.RotateKEK(ctx, nextRef, nextKEK); err != nil {
+		_ = s.vaultKeys.delete(context.Background(), nextRevision)
 		_ = s.registry.rememberDevice(context.Background(), s.selected.Path, previousDevice)
 		return vaultStatus{}, fmt.Errorf("rotate vault KEK: %w", err)
 	}
+	_ = s.vaultKeys.deleteExcept(ctx, nextRevision)
 
 	s.selected.PreferredDevicePath = device.Path
 	s.selected.PreferredDeviceProduct = device.Product
@@ -501,32 +528,6 @@ func (s *VaultService) Delete(ctx context.Context, alias string, expectedRevisio
 		return errors.New("vault is locked")
 	}
 	return s.values.delete(ctx, alias, expectedRevision)
-}
-
-func (s *VaultService) provisionVaultDEK(auth fidoAuthenticator, pin string) (store.Record, *memguard.Enclave, error) {
-	salt := make([]byte, store.SaltSize)
-	if _, err := rand.Read(salt); err != nil {
-		return store.Record{}, nil, fmt.Errorf("generate vault DEK salt: %w", err)
-	}
-	credential, err := s.createCredential(auth, pin, "vault-dek")
-	if err != nil {
-		return store.Record{}, nil, err
-	}
-	record := store.Record{
-		Alias:        vaultDEKAlias,
-		CredentialID: credential.ID,
-		Salt:         salt,
-		RPID:         vaultRPID,
-	}
-	dek, err := s.derive(auth, pin, store.KEKReference{
-		CredentialID: record.CredentialID,
-		Salt:         record.Salt,
-		RPID:         record.RPID,
-	}, "vault-dek")
-	if err != nil {
-		return store.Record{}, nil, err
-	}
-	return record, dek, nil
 }
 
 func (s *VaultService) openAuthenticator(path string) (fidoAuthenticator, authenticatorInfo, error) {

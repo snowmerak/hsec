@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"os"
@@ -13,11 +14,13 @@ import (
 
 	"github.com/awnumar/memguard"
 	"github.com/snowmerak/hmacsecret/lib/hmacsecret"
+	"github.com/snowmerak/hmacsecret/lib/store"
 )
 
 type fakeAuthenticator struct {
 	mu          sync.Mutex
 	credentials int
+	derivations int
 	delay       time.Duration
 	marker      byte
 }
@@ -35,6 +38,9 @@ func (a *fakeAuthenticator) CreateCredential(opts hmacsecret.CreateOptions) (*hm
 
 func (a *fakeAuthenticator) Derive(opts hmacsecret.DeriveOptions) (*hmacsecret.Secret, error) {
 	time.Sleep(a.delay)
+	a.mu.Lock()
+	a.derivations++
+	a.mu.Unlock()
 	if len(opts.CredentialID) == 0 || opts.CredentialID[0] != a.marker {
 		return nil, errors.New("credential is not available on this authenticator")
 	}
@@ -48,6 +54,12 @@ func (a *fakeAuthenticator) Derive(opts hmacsecret.DeriveOptions) (*hmacsecret.S
 		Salt:         append([]byte(nil), opts.Salt...),
 		HMACSecret:   memguard.NewEnclave(key[:]),
 	}, nil
+}
+
+func (a *fakeAuthenticator) counts() (credentials, derivations int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.credentials, a.derivations
 }
 
 func TestRotateKEKRewrapsMetadataAndPersistsNewAuthenticator(t *testing.T) {
@@ -76,6 +88,9 @@ func TestRotateKEKRewrapsMetadataAndPersistsNewAuthenticator(t *testing.T) {
 	if _, err := service.Initialize(ctx, devices[0].Path, ""); err != nil {
 		t.Fatal(err)
 	}
+	if credentials, derivations := firstAuth.counts(); credentials != 1 || derivations != 1 {
+		t.Fatalf("initialization FIDO calls = (%d create, %d derive), want (1, 1)", credentials, derivations)
+	}
 	value := vaultValueDocument{
 		Version: vaultValueDocumentVersion,
 		Fields:  []vaultValueField{{Name: "token", Value: "survives-kek-rotation"}},
@@ -87,26 +102,16 @@ func TestRotateKEKRewrapsMetadataAndPersistsNewAuthenticator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	beforeDEKRef, err := service.metadata.Get(ctx, vaultDEKAlias)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := service.metadata.Get(ctx, vaultDEKAlias); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("new vault stored a legacy FIDO vault-DEK credential: %v", err)
 	}
 
-	if _, err := service.RotateKEK(ctx, devices[1].Path, ""); err == nil {
-		t.Fatal("RotateKEK accepted an authenticator without the current vault DEK credential")
-	}
-	rejectedHeader, err := service.metadata.Header(ctx)
+	status, err := service.RotateKEK(ctx, devices[1].Path, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rejectedHeader.Revision != beforeHeader.Revision ||
-		!bytes.Equal(rejectedHeader.KEK.CredentialID, beforeHeader.KEK.CredentialID) {
-		t.Fatal("rejected rotation changed the KEK header")
-	}
-
-	status, err := service.RotateKEK(ctx, devices[0].Path, "")
-	if err != nil {
-		t.Fatal(err)
+	if credentials, derivations := secondAuth.counts(); credentials != 1 || derivations != 1 {
+		t.Fatalf("KEK rotation FIDO calls = (%d create, %d derive), want (1, 1)", credentials, derivations)
 	}
 	if !status.Initialized || !status.Unlocked {
 		t.Fatalf("unexpected rotated status: %+v", status)
@@ -125,13 +130,16 @@ func TestRotateKEKRewrapsMetadataAndPersistsNewAuthenticator(t *testing.T) {
 	if bytes.Equal(afterHeader.WrappedDEK.Ciphertext, beforeHeader.WrappedDEK.Ciphertext) {
 		t.Fatal("metadata DEK was not rewrapped during KEK rotation")
 	}
-	afterDEKRef, err := service.metadata.Get(ctx, vaultDEKAlias)
-	if err != nil {
+	var envelopeCount int
+	var envelopeRevision uint64
+	if err := service.vaultKeys.db.QueryRowContext(ctx, `
+SELECT COUNT(*), MIN(header_revision) FROM vault_key_envelopes`).Scan(
+		&envelopeCount, &envelopeRevision,
+	); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(afterDEKRef.CredentialID, beforeDEKRef.CredentialID) ||
-		!bytes.Equal(afterDEKRef.Salt, beforeDEKRef.Salt) {
-		t.Fatal("vault DEK reference changed during KEK rotation")
+	if envelopeCount != 1 || envelopeRevision != afterHeader.Revision {
+		t.Fatalf("wrapped vault DEKs = (%d at revision %d), want (1 at revision %d)", envelopeCount, envelopeRevision, afterHeader.Revision)
 	}
 	entry, err := service.Get(ctx, "rotation-test")
 	if err != nil || entry.Value.Fields[0].Value != "survives-kek-rotation" {
@@ -141,16 +149,22 @@ func TestRotateKEKRewrapsMetadataAndPersistsNewAuthenticator(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(refs) != 1 || refs[0].PreferredDevicePath != devices[0].Path {
+	if len(refs) != 1 || refs[0].PreferredDevicePath != devices[1].Path {
 		t.Fatalf("preferred authenticator was not rotated: %+v", refs)
 	}
 
 	service.Lock()
-	if _, err := service.RotateKEK(ctx, devices[0].Path, ""); err == nil {
+	if _, err := service.RotateKEK(ctx, devices[1].Path, ""); err == nil {
 		t.Fatal("RotateKEK succeeded while vault was locked")
 	}
-	if _, err := service.Unlock(ctx, devices[0].Path, ""); err != nil {
+	if _, err := service.Unlock(ctx, devices[0].Path, ""); err == nil {
+		t.Fatal("previous authenticator unlocked the vault after KEK rotation")
+	}
+	if _, err := service.Unlock(ctx, devices[1].Path, ""); err != nil {
 		t.Fatalf("authenticator did not unlock the vault with its rotated credential: %v", err)
+	}
+	if credentials, derivations := secondAuth.counts(); credentials != 1 || derivations != 2 {
+		t.Fatalf("rotated authenticator calls after unlock = (%d create, %d derive), want (1, 2)", credentials, derivations)
 	}
 	entry, err = service.Get(ctx, "rotation-test")
 	if err != nil || entry.Value.Fields[0].Value != "survives-kek-rotation" {
@@ -188,7 +202,8 @@ func newTestVaultService(t *testing.T, auth *fakeAuthenticator) (*VaultService, 
 }
 
 func TestVaultLifecycleAndEncryptedStorage(t *testing.T) {
-	service, dataDir := newTestVaultService(t, &fakeAuthenticator{})
+	auth := &fakeAuthenticator{}
+	service, dataDir := newTestVaultService(t, auth)
 	ctx := context.Background()
 
 	status, err := service.Status(ctx)
@@ -205,6 +220,9 @@ func TestVaultLifecycleAndEncryptedStorage(t *testing.T) {
 	}
 	if !status.Initialized || !status.Unlocked {
 		t.Fatalf("unexpected initialized status: %+v", status)
+	}
+	if credentials, derivations := auth.counts(); credentials != 1 || derivations != 1 {
+		t.Fatalf("initialization FIDO calls = (%d create, %d derive), want (1, 1)", credentials, derivations)
 	}
 
 	const (
@@ -272,6 +290,9 @@ func TestVaultLifecycleAndEncryptedStorage(t *testing.T) {
 	if _, err := service.Unlock(ctx, "fake://security-key", ""); err != nil {
 		t.Fatal(err)
 	}
+	if credentials, derivations := auth.counts(); credentials != 1 || derivations != 2 {
+		t.Fatalf("calls after unlock = (%d create, %d derive), want (1, 2)", credentials, derivations)
+	}
 	reloaded, err := service.Get(ctx, alias)
 	if err != nil {
 		t.Fatal(err)
@@ -285,6 +306,101 @@ func TestVaultLifecycleAndEncryptedStorage(t *testing.T) {
 	}
 	if _, err := service.Get(ctx, alias); err != errEntryNotFound {
 		t.Fatalf("got deleted entry error %v, want %v", err, errEntryNotFound)
+	}
+}
+
+func TestLegacyVaultDEKIsMigratedAfterFirstUnlock(t *testing.T) {
+	ctx := context.Background()
+	auth := &fakeAuthenticator{marker: 7}
+	service, _ := newTestVaultService(t, auth)
+
+	rootSalt := make([]byte, store.SaltSize)
+	if _, err := rand.Read(rootSalt); err != nil {
+		t.Fatal(err)
+	}
+	rootCredential, err := service.createCredential(auth, "", "root-kek")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootRef := store.KEKReference{
+		CredentialID: rootCredential.ID,
+		Salt:         rootSalt,
+		RPID:         vaultRPID,
+	}
+	rootKEK, err := service.derive(auth, "", rootRef, "root-kek")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.metadata.Initialize(ctx, rootRef, rootKEK); err != nil {
+		t.Fatal(err)
+	}
+
+	legacySalt := make([]byte, store.SaltSize)
+	if _, err := rand.Read(legacySalt); err != nil {
+		t.Fatal(err)
+	}
+	legacyCredential, err := service.createCredential(auth, "", vaultDEKAlias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyRef := store.KEKReference{
+		CredentialID: legacyCredential.ID,
+		Salt:         legacySalt,
+		RPID:         vaultRPID,
+	}
+	legacyDEK, err := service.derive(auth, "", legacyRef, vaultDEKAlias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.metadata.Put(ctx, store.Record{
+		Alias:        vaultDEKAlias,
+		CredentialID: legacyRef.CredentialID,
+		Salt:         legacyRef.Salt,
+		RPID:         legacyRef.RPID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service.vaultDEK = legacyDEK
+	if _, err := service.Create(ctx, "legacy-entry", vaultValueDocument{
+		Version: vaultValueDocumentVersion,
+		Fields:  []vaultValueField{{Name: "token", Value: "migrated-secret"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service.Lock()
+
+	if credentials, derivations := auth.counts(); credentials != 2 || derivations != 2 {
+		t.Fatalf("legacy setup FIDO calls = (%d create, %d derive), want (2, 2)", credentials, derivations)
+	}
+	if _, err := service.Unlock(ctx, "fake://security-key", ""); err != nil {
+		t.Fatal(err)
+	}
+	if credentials, derivations := auth.counts(); credentials != 2 || derivations != 4 {
+		t.Fatalf("migration unlock calls = (%d create, %d derive), want (2, 4)", credentials, derivations)
+	}
+	if _, err := service.metadata.Get(ctx, vaultDEKAlias); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("legacy vault-DEK reference was not removed: %v", err)
+	}
+	var envelopeCount int
+	if err := service.vaultKeys.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM vault_key_envelopes`,
+	).Scan(&envelopeCount); err != nil {
+		t.Fatal(err)
+	}
+	if envelopeCount != 1 {
+		t.Fatalf("wrapped vault DEK count = %d, want 1", envelopeCount)
+	}
+	entry, err := service.Get(ctx, "legacy-entry")
+	if err != nil || entry.Value.Fields[0].Value != "migrated-secret" {
+		t.Fatalf("read migrated entry: entry=%+v err=%v", entry, err)
+	}
+
+	service.Lock()
+	if _, err := service.Unlock(ctx, "fake://security-key", ""); err != nil {
+		t.Fatal(err)
+	}
+	if credentials, derivations := auth.counts(); credentials != 2 || derivations != 5 {
+		t.Fatalf("post-migration unlock calls = (%d create, %d derive), want (2, 5)", credentials, derivations)
 	}
 }
 
@@ -450,11 +566,11 @@ func TestVaultRegistryPersistsFolderAndSelectedAuthenticator(t *testing.T) {
 
 func TestExistingDefaultVaultIsRegisteredInPlace(t *testing.T) {
 	appDataDir := t.TempDir()
-	metadata, values, err := openVaultStores(appDataDir)
+	metadata, vaultKeys, values, err := openVaultStores(appDataDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := errors.Join(values.close(), metadata.Close()); err != nil {
+	if err := errors.Join(values.close(), vaultKeys.close(), metadata.Close()); err != nil {
 		t.Fatal(err)
 	}
 
