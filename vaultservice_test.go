@@ -19,6 +19,7 @@ type fakeAuthenticator struct {
 	mu          sync.Mutex
 	credentials int
 	delay       time.Duration
+	marker      byte
 }
 
 func (a *fakeAuthenticator) CreateCredential(opts hmacsecret.CreateOptions) (*hmacsecret.Credential, error) {
@@ -27,13 +28,16 @@ func (a *fakeAuthenticator) CreateCredential(opts hmacsecret.CreateOptions) (*hm
 	defer a.mu.Unlock()
 	a.credentials++
 	return &hmacsecret.Credential{
-		ID:   []byte{byte(a.credentials), 0x48, 0x53, 0x45, 0x43},
+		ID:   []byte{a.marker, byte(a.credentials), 0x48, 0x53, 0x45, 0x43},
 		RPID: opts.RPID,
 	}, nil
 }
 
 func (a *fakeAuthenticator) Derive(opts hmacsecret.DeriveOptions) (*hmacsecret.Secret, error) {
 	time.Sleep(a.delay)
+	if len(opts.CredentialID) == 0 || opts.CredentialID[0] != a.marker {
+		return nil, errors.New("credential is not available on this authenticator")
+	}
 	material := make([]byte, 0, len(opts.RPID)+len(opts.CredentialID)+len(opts.Salt))
 	material = append(material, opts.RPID...)
 	material = append(material, opts.CredentialID...)
@@ -44,6 +48,114 @@ func (a *fakeAuthenticator) Derive(opts hmacsecret.DeriveOptions) (*hmacsecret.S
 		Salt:         append([]byte(nil), opts.Salt...),
 		HMACSecret:   memguard.NewEnclave(key[:]),
 	}, nil
+}
+
+func TestRotateKEKRewrapsMetadataAndPersistsNewAuthenticator(t *testing.T) {
+	ctx := context.Background()
+	firstAuth := &fakeAuthenticator{marker: 1}
+	secondAuth := &fakeAuthenticator{marker: 2}
+	service, _ := newTestVaultService(t, firstAuth)
+	devices := []hmacsecret.DeviceInfo{
+		{Index: 0, Path: "fake://first", Product: "First Key", Manufacturer: "Example", VendorID: 1, ProductID: 2},
+		{Index: 1, Path: "fake://second", Product: "Second Key", Manufacturer: "Example", VendorID: 3, ProductID: 4},
+	}
+	service.devices = func(hmacsecret.ListOptions) ([]hmacsecret.DeviceInfo, error) {
+		return devices, nil
+	}
+	service.open = func(path string) (fidoAuthenticator, error) {
+		switch path {
+		case devices[0].Path:
+			return firstAuth, nil
+		case devices[1].Path:
+			return secondAuth, nil
+		default:
+			return nil, errors.New("unknown authenticator")
+		}
+	}
+
+	if _, err := service.Initialize(ctx, devices[0].Path, ""); err != nil {
+		t.Fatal(err)
+	}
+	value := vaultValueDocument{
+		Version: vaultValueDocumentVersion,
+		Fields:  []vaultValueField{{Name: "token", Value: "survives-kek-rotation"}},
+	}
+	if _, err := service.Create(ctx, "rotation-test", value); err != nil {
+		t.Fatal(err)
+	}
+	beforeHeader, err := service.metadata.Header(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeDEKRef, err := service.metadata.Get(ctx, vaultDEKAlias)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.RotateKEK(ctx, devices[1].Path, ""); err == nil {
+		t.Fatal("RotateKEK accepted an authenticator without the current vault DEK credential")
+	}
+	rejectedHeader, err := service.metadata.Header(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejectedHeader.Revision != beforeHeader.Revision ||
+		!bytes.Equal(rejectedHeader.KEK.CredentialID, beforeHeader.KEK.CredentialID) {
+		t.Fatal("rejected rotation changed the KEK header")
+	}
+
+	status, err := service.RotateKEK(ctx, devices[0].Path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.Initialized || !status.Unlocked {
+		t.Fatalf("unexpected rotated status: %+v", status)
+	}
+	afterHeader, err := service.metadata.Header(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterHeader.Revision != beforeHeader.Revision+1 {
+		t.Fatalf("header revision = %d, want %d", afterHeader.Revision, beforeHeader.Revision+1)
+	}
+	if bytes.Equal(afterHeader.KEK.CredentialID, beforeHeader.KEK.CredentialID) ||
+		bytes.Equal(afterHeader.KEK.Salt, beforeHeader.KEK.Salt) {
+		t.Fatal("rotated header retained the previous KEK reference")
+	}
+	if bytes.Equal(afterHeader.WrappedDEK.Ciphertext, beforeHeader.WrappedDEK.Ciphertext) {
+		t.Fatal("metadata DEK was not rewrapped during KEK rotation")
+	}
+	afterDEKRef, err := service.metadata.Get(ctx, vaultDEKAlias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(afterDEKRef.CredentialID, beforeDEKRef.CredentialID) ||
+		!bytes.Equal(afterDEKRef.Salt, beforeDEKRef.Salt) {
+		t.Fatal("vault DEK reference changed during KEK rotation")
+	}
+	entry, err := service.Get(ctx, "rotation-test")
+	if err != nil || entry.Value.Fields[0].Value != "survives-kek-rotation" {
+		t.Fatalf("read after rotation: entry=%+v err=%v", entry, err)
+	}
+	refs, err := service.Vaults(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || refs[0].PreferredDevicePath != devices[0].Path {
+		t.Fatalf("preferred authenticator was not rotated: %+v", refs)
+	}
+
+	service.Lock()
+	if _, err := service.RotateKEK(ctx, devices[0].Path, ""); err == nil {
+		t.Fatal("RotateKEK succeeded while vault was locked")
+	}
+	if _, err := service.Unlock(ctx, devices[0].Path, ""); err != nil {
+		t.Fatalf("authenticator did not unlock the vault with its rotated credential: %v", err)
+	}
+	entry, err = service.Get(ctx, "rotation-test")
+	if err != nil || entry.Value.Fields[0].Value != "survives-kek-rotation" {
+		t.Fatalf("read after unlocking rotated vault: entry=%+v err=%v", entry, err)
+	}
 }
 
 func newTestVaultService(t *testing.T, auth *fakeAuthenticator) (*VaultService, string) {

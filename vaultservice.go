@@ -379,6 +379,77 @@ func (s *VaultService) Unlock(ctx context.Context, devicePath, pin string) (vaul
 	return s.statusLocked(ctx)
 }
 
+// RotateKEK replaces the public root credential reference and rewraps the
+// metadata-store DEK without rewriting the encrypted vault metadata or values.
+// The vault must already be unlocked so the existing metadata-store DEK is
+// available for rewrapping.
+func (s *VaultService) RotateKEK(ctx context.Context, devicePath, pin string) (vaultStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.metadata == nil {
+		return vaultStatus{}, errors.New("select a vault before rotating its KEK")
+	}
+	if s.vaultDEK == nil {
+		return vaultStatus{}, errors.New("vault is locked")
+	}
+
+	auth, device, err := s.openAuthenticator(devicePath)
+	if err != nil {
+		return vaultStatus{}, err
+	}
+	dekRecord, err := s.metadata.Get(ctx, vaultDEKAlias)
+	if err != nil {
+		return vaultStatus{}, fmt.Errorf("load vault DEK reference before KEK rotation: %w", err)
+	}
+	if _, err := s.derive(auth, pin, store.KEKReference{
+		CredentialID: dekRecord.CredentialID,
+		Salt:         dekRecord.Salt,
+		RPID:         dekRecord.RPID,
+	}, "vault-dek-validation"); err != nil {
+		return vaultStatus{}, fmt.Errorf("selected authenticator cannot derive the current vault DEK: %w", err)
+	}
+	salt := make([]byte, store.SaltSize)
+	if _, err := rand.Read(salt); err != nil {
+		return vaultStatus{}, fmt.Errorf("generate rotated root salt: %w", err)
+	}
+	credential, err := s.createCredential(auth, pin, "root-kek-rotation")
+	if err != nil {
+		return vaultStatus{}, err
+	}
+	nextRef := store.KEKReference{
+		CredentialID: credential.ID,
+		Salt:         salt,
+		RPID:         vaultRPID,
+	}
+	nextKEK, err := s.derive(auth, pin, nextRef, "root-kek-rotation")
+	if err != nil {
+		return vaultStatus{}, err
+	}
+
+	previousDevice := authenticatorInfo{
+		Path:         s.selected.PreferredDevicePath,
+		Product:      s.selected.PreferredDeviceProduct,
+		Manufacturer: s.selected.PreferredDeviceManufacturer,
+		VendorID:     s.selected.PreferredDeviceVendorID,
+		ProductID:    s.selected.PreferredDeviceProductID,
+	}
+	if err := s.registry.rememberDevice(ctx, s.selected.Path, device); err != nil {
+		return vaultStatus{}, err
+	}
+	if err := s.metadata.RotateKEK(ctx, nextRef, nextKEK); err != nil {
+		_ = s.registry.rememberDevice(context.Background(), s.selected.Path, previousDevice)
+		return vaultStatus{}, fmt.Errorf("rotate vault KEK: %w", err)
+	}
+
+	s.selected.PreferredDevicePath = device.Path
+	s.selected.PreferredDeviceProduct = device.Product
+	s.selected.PreferredDeviceManufacturer = device.Manufacturer
+	s.selected.PreferredDeviceVendorID = device.VendorID
+	s.selected.PreferredDeviceProductID = device.ProductID
+	return s.statusLocked(ctx)
+}
+
 func (s *VaultService) Lock() vaultStatus {
 	s.mu.Lock()
 	defer s.mu.Unlock()

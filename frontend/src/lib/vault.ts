@@ -51,6 +51,7 @@ export interface VaultAPI {
   Authenticators(): Promise<AuthenticatorInfo[]>;
   Initialize(devicePath: string, pin: string): Promise<VaultStatus>;
   Unlock(devicePath: string, pin: string): Promise<VaultStatus>;
+  RotateKEK(devicePath: string, pin: string): Promise<VaultStatus>;
   Lock(): Promise<VaultStatus>;
   List(): Promise<VaultEntrySummary[]>;
   Get(alias: string): Promise<VaultEntry>;
@@ -166,6 +167,20 @@ const mockVault: VaultAPI = {
     mockUnlocked = true;
     return mockStatus();
   },
+  async RotateKEK(devicePath) {
+    if (!mockUnlocked) throw new Error("vault is locked");
+    const device = mockAuthenticators.find((item) => item.path === devicePath);
+    if (!device) throw new Error("select a FIDO2 security key");
+    mockReferences = mockReferences.map((reference) => reference.path === mockSelectedPath ? {
+      ...reference,
+      preferredDevicePath: device.path,
+      preferredDeviceProduct: device.product,
+      preferredDeviceManufacturer: device.manufacturer,
+      preferredDeviceVendorId: device.vendorId,
+      preferredDeviceProductId: device.productId,
+    } : reference);
+    return mockStatus();
+  },
   async Lock() {
     mockUnlocked = false;
     return mockStatus();
@@ -237,6 +252,9 @@ const wailsVault: VaultAPI = {
   },
   async Unlock(devicePath, pin) {
     return WailsVault.Unlock(devicePath, pin);
+  },
+  async RotateKEK(devicePath, pin) {
+    return WailsVault.RotateKEK(devicePath, pin);
   },
   async Lock() {
     return WailsVault.Lock();

@@ -156,10 +156,16 @@ button:disabled {
   line-height: 1.55;
 }
 
-.lock-button {
+.sidebar-actions {
+  display: grid;
+  margin-top: auto;
+  gap: 4px;
+}
+
+.lock-button,
+.rotation-button {
   width: 100%;
   min-height: 42px;
-  margin-top: auto;
   justify-content: flex-start;
   color: var(--mp-accent-200);
 }
@@ -712,6 +718,46 @@ button:disabled {
   box-shadow: var(--mp-shadow-panel);
 }
 
+.rotation-dialog {
+  width: min(540px, 100%);
+  max-height: calc(100vh - 48px);
+  padding: 24px;
+  overflow: auto;
+  background: var(--mp-bg-surface);
+  box-shadow: var(--mp-shadow-panel);
+}
+
+.rotation-form {
+  display: grid;
+  gap: 16px;
+}
+
+.rotation-heading {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.rotation-warning {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--mp-warning-text) 24%, transparent);
+  border-radius: var(--radius-md);
+  color: var(--mp-warning-text);
+  background: var(--mp-warning-wash);
+  font-size: 0.78rem;
+  line-height: 1.55;
+}
+
+.rotation-authenticator-picker {
+  max-height: 250px;
+}
+
+.rotation-actions {
+  grid-column: auto;
+}
+
 .confirmation-icon {
   display: grid;
   width: 42px;
@@ -865,11 +911,23 @@ button:disabled {
     min-width: max-content;
   }
 
-  .lock-button {
+  .sidebar-actions {
     position: absolute;
     top: 20px;
     right: 130px;
-    width: auto;
+    display: flex;
+    margin: 0;
+  }
+
+  .sidebar-actions .mp-button {
+    width: 42px;
+    min-width: 42px;
+    padding-inline: 0;
+    justify-content: center;
+  }
+
+  .sidebar-action-label {
+    display: none;
   }
 
   .editor {

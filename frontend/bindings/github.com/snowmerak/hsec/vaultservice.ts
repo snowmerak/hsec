@@ -45,6 +45,16 @@ export function Lock(): $CancellablePromise<$models.vaultStatus> {
     return $Call.ByID(337357262);
 }
 
+/**
+ * RotateKEK replaces the public root credential reference and rewraps the
+ * metadata-store DEK without rewriting the encrypted vault metadata or values.
+ * The vault must already be unlocked so the existing metadata-store DEK is
+ * available for rewrapping.
+ */
+export function RotateKEK(devicePath: string, pin: string): $CancellablePromise<$models.vaultStatus> {
+    return $Call.ByID(1224869511, devicePath, pin);
+}
+
 export function SelectVault(path: string): $CancellablePromise<$models.vaultStatus> {
     return $Call.ByID(2605194843, path);
 }

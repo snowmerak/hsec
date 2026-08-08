@@ -40,6 +40,9 @@
   let fields: VaultValueField[] = $state([]);
   let revealed: boolean[] = $state([]);
   let pin = $state("");
+  let kekRotationOpen = $state(false);
+  let rotationDevicePath = $state("");
+  let rotationPin = $state("");
   let busy = $state(false);
   let dirty = $state(false);
   let creating = $state(false);
@@ -178,6 +181,62 @@
       pin = "";
       await refreshEntries();
       showToast("success", wasInitialized ? "vault가 열렸습니다" : "vault가 준비됐습니다", "보안 키로 암호화 키를 안전하게 유도했습니다.");
+    } catch (error) {
+      showError(error);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function openKEKRotation() {
+    if (busy) return;
+    kekRotationOpen = true;
+    rotationPin = "";
+    rotationDevicePath = "";
+    await refreshRotationAuthenticators();
+  }
+
+  async function refreshRotationAuthenticators() {
+    loadingDevices = true;
+    try {
+      authenticators = await vault.Authenticators();
+      const currentVault = vaultReferences.find((reference) => reference.path === status?.vaultPath);
+      const selected = authenticators.find((device) => device.path === rotationDevicePath);
+      const preferred = authenticators.find((device) =>
+        device.path === currentVault?.preferredDevicePath
+        || (
+          currentVault?.preferredDeviceVendorId !== 0
+          && device.vendorId === currentVault?.preferredDeviceVendorId
+          && device.productId === currentVault.preferredDeviceProductId
+          && device.product === currentVault.preferredDeviceProduct
+        ),
+      );
+      rotationDevicePath = selected?.path ?? preferred?.path ?? (authenticators.length === 1 ? authenticators[0].path : "");
+    } catch (error) {
+      authenticators = [];
+      rotationDevicePath = "";
+      showError(error);
+    } finally {
+      loadingDevices = false;
+    }
+  }
+
+  function closeKEKRotation() {
+    if (busy) return;
+    kekRotationOpen = false;
+    rotationDevicePath = "";
+    rotationPin = "";
+  }
+
+  async function rotateKEK() {
+    if (!rotationDevicePath || busy) return;
+    busy = true;
+    try {
+      status = await vault.RotateKEK(rotationDevicePath, rotationPin);
+      rotationPin = "";
+      kekRotationOpen = false;
+      await refreshVaultReferences();
+      showToast("success", "KEK를 회전했습니다", "새 credential로 metadata DEK를 다시 보호했습니다.");
     } catch (error) {
       showError(error);
     } finally {
@@ -424,6 +483,11 @@
 </script>
 
 <svelte:window onkeydown={(event) => {
+  if (event.key === "Escape" && kekRotationOpen) {
+    event.preventDefault();
+    closeKEKRotation();
+    return;
+  }
   if (event.key === "Escape" && pendingConfirmation) {
     event.preventDefault();
     closeConfirmation();
@@ -581,10 +645,16 @@
         {/each}
       </nav>
 
-      <button class="mp-button mp-button--ghost lock-button" onclick={lockVault}>
-        <Icon name="lock"/>
-        잠그기
-      </button>
+      <div class="sidebar-actions">
+        <button class="mp-button mp-button--ghost rotation-button" disabled={busy} title="KEK 회전" onclick={openKEKRotation}>
+          <Icon name="key"/>
+          <span class="sidebar-action-label">KEK 회전</span>
+        </button>
+        <button class="mp-button mp-button--ghost lock-button" disabled={busy} title="vault 잠그기" onclick={lockVault}>
+          <Icon name="lock"/>
+          <span class="sidebar-action-label">잠그기</span>
+        </button>
+      </div>
     </aside>
 
     <section class="editor">
@@ -707,6 +777,81 @@
       </div>
     </section>
   </main>
+{/if}
+
+{#if kekRotationOpen}
+  <div class="confirmation-backdrop" role="presentation">
+    <div
+      class="mp-card rotation-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="rotation-title"
+    >
+      <form
+        class="rotation-form"
+        onsubmit={(event) => {
+          event.preventDefault();
+          void rotateKEK();
+        }}
+      >
+      <div class="rotation-heading">
+        <div class="confirmation-icon"><Icon name="key" size={22}/></div>
+        <div class="confirmation-copy">
+          <h2 id="rotation-title">Root KEK 회전</h2>
+          <p>새 FIDO credential과 salt를 만들고 metadata DEK를 다시 보호합니다.</p>
+        </div>
+      </div>
+
+      <p class="rotation-warning">
+        현재 vault DEK credential도 사용할 수 있는 보안 키를 선택해야 합니다. 다른 물리 키로의 이전은 DEK 회전 단계에서 지원합니다.
+      </p>
+
+      <fieldset class="authenticator-picker rotation-authenticator-picker">
+        <div class="authenticator-picker-heading">
+          <legend class="mp-field__label">FIDO2 보안 키</legend>
+          <button class="mp-button mp-button--ghost mp-button--sm" type="button" disabled={loadingDevices || busy} onclick={refreshRotationAuthenticators}>
+            <Icon name="refresh" size={15}/>
+            새로고침
+          </button>
+        </div>
+        {#if loadingDevices}
+          <div class="authenticator-empty"><span class="mp-spinner"></span>연결된 장치를 찾는 중…</div>
+        {:else if authenticators.length === 0}
+          <div class="authenticator-empty">연결된 FIDO2 보안 키가 없습니다.</div>
+        {:else}
+          <div class="authenticator-list" role="radiogroup" aria-label="KEK 회전용 FIDO2 보안 키">
+            {#each authenticators as device (device.path)}
+              <label class="authenticator-option" class:authenticator-option--selected={rotationDevicePath === device.path}>
+                <input type="radio" name="rotation-authenticator" value={device.path} bind:group={rotationDevicePath}/>
+                <span class="authenticator-icon"><Icon name="usb" size={19}/></span>
+                <span class="authenticator-copy">
+                  <strong>{device.product || "FIDO2 보안 키"}</strong>
+                  <span>{device.windowsHello ? "Windows Security에서 장치를 선택합니다" : device.manufacturer || "제조사 정보 없음"}</span>
+                </span>
+                {#if !device.windowsHello}
+                  <span class="authenticator-id">{formatUSBID(device.vendorId, device.productId)}</span>
+                {/if}
+              </label>
+            {/each}
+          </div>
+        {/if}
+      </fieldset>
+
+      <label class="mp-field">
+        <span class="mp-field__label">보안 키 PIN <span class="optional">(선택)</span></span>
+        <input class="mp-input" name="rotation-pin" type="password" bind:value={rotationPin} autocomplete="off" placeholder="플랫폼에서 직접 처리하면 비워 두세요"/>
+      </label>
+
+      <div class="confirmation-actions rotation-actions">
+        <button class="mp-button mp-button--secondary" type="button" disabled={busy} onclick={closeKEKRotation}>취소</button>
+        <button class="mp-button mp-button--primary" type="submit" disabled={busy || loadingDevices || !rotationDevicePath}>
+          <Icon name="refresh" size={16}/>
+          {busy ? "보안 키 기다리는 중…" : "KEK 회전"}
+        </button>
+      </div>
+      </form>
+    </div>
+  </div>
 {/if}
 
 {#if pendingConfirmation}
