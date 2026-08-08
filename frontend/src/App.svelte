@@ -21,6 +21,13 @@
     persistent?: boolean;
   };
   type FidoEvent = {operationId: string; phase: string; message: string};
+  type DEKRotationProgress = {
+    phase: "ready" | "copying" | "switching" | "completed" | "failed";
+    completed: number;
+    total: number;
+    percent: number;
+    message: string;
+  };
   type Confirmation = {
     title: string;
     message: string;
@@ -43,6 +50,15 @@
   let kekRotationOpen = $state(false);
   let rotationDevicePath = $state("");
   let rotationPin = $state("");
+  let dekRotationOpen = $state(false);
+  let dekRotationRunning = $state(false);
+  let dekProgress: DEKRotationProgress = $state({
+    phase: "ready",
+    completed: 0,
+    total: 0,
+    percent: 0,
+    message: "모든 항목을 새 키로 다시 암호화합니다.",
+  });
   let busy = $state(false);
   let dirty = $state(false);
   let creating = $state(false);
@@ -67,6 +83,9 @@
       const data = event.data as FidoEvent;
       toasts = toasts.filter((toast) => toast.id !== data.operationId);
     });
+    const offDEKProgress = Events.On("vault:dek-rotation-progress", (event) => {
+      dekProgress = event.data as DEKRotationProgress;
+    });
     if (import.meta.env.DEV && new URLSearchParams(window.location.search).get("toast") === "fido") {
       toasts = [{
         id: "preview-fido",
@@ -80,6 +99,7 @@
     return () => {
       offWaiting();
       offResolved();
+      offDEKProgress();
     };
   });
 
@@ -240,6 +260,41 @@
     } catch (error) {
       showError(error);
     } finally {
+      busy = false;
+    }
+  }
+
+  function openDEKRotation() {
+    if (busy) return;
+    dekProgress = {
+      phase: "ready",
+      completed: 0,
+      total: entries.length,
+      percent: 0,
+      message: "기존 DB는 완료 시점까지 그대로 유지됩니다.",
+    };
+    dekRotationOpen = true;
+  }
+
+  function closeDEKRotation() {
+    if (dekRotationRunning) return;
+    dekRotationOpen = false;
+  }
+
+  async function rotateDEK() {
+    if (busy || dekRotationRunning) return;
+    busy = true;
+    dekRotationRunning = true;
+    try {
+      status = await vault.RotateDEK();
+      dekRotationOpen = false;
+      showToast("success", "DEK를 회전했습니다", `${entries.length}개 항목을 새 키로 다시 암호화했습니다.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      dekProgress = {...dekProgress, phase: "failed", message};
+      showError(error);
+    } finally {
+      dekRotationRunning = false;
       busy = false;
     }
   }
@@ -488,6 +543,11 @@
     closeKEKRotation();
     return;
   }
+  if (event.key === "Escape" && dekRotationOpen) {
+    event.preventDefault();
+    closeDEKRotation();
+    return;
+  }
   if (event.key === "Escape" && pendingConfirmation) {
     event.preventDefault();
     closeConfirmation();
@@ -646,6 +706,10 @@
       </nav>
 
       <div class="sidebar-actions">
+        <button class="mp-button mp-button--ghost rotation-button" disabled={busy} title="DEK 회전" onclick={openDEKRotation}>
+          <Icon name="refresh"/>
+          <span class="sidebar-action-label">DEK 회전</span>
+        </button>
         <button class="mp-button mp-button--ghost rotation-button" disabled={busy} title="KEK 회전" onclick={openKEKRotation}>
           <Icon name="key"/>
           <span class="sidebar-action-label">KEK 회전</span>
@@ -803,7 +867,7 @@
       </div>
 
       <p class="rotation-warning">
-        현재 vault DEK credential도 사용할 수 있는 보안 키를 선택해야 합니다. 다른 물리 키로의 이전은 DEK 회전 단계에서 지원합니다.
+        다른 보안 키를 선택하면 현재 vault의 DEK는 유지한 채 새 Root KEK로 다시 보호됩니다.
       </p>
 
       <fieldset class="authenticator-picker rotation-authenticator-picker">
@@ -850,6 +914,55 @@
         </button>
       </div>
       </form>
+    </div>
+  </div>
+{/if}
+
+{#if dekRotationOpen}
+  <div class="confirmation-backdrop" role="presentation">
+    <div
+      class="mp-card rotation-dialog dek-rotation-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="dek-rotation-title"
+      aria-describedby="dek-rotation-description"
+    >
+      <div class="rotation-form">
+        <div class="rotation-heading">
+          <div class="confirmation-icon"><Icon name="refresh" size={22}/></div>
+          <div class="confirmation-copy">
+            <h2 id="dek-rotation-title">Vault DEK 회전</h2>
+            <p id="dek-rotation-description">새 랜덤 DEK로 모든 저장 항목을 다시 암호화합니다. FIDO2 작업은 발생하지 않습니다.</p>
+          </div>
+        </div>
+
+        {#if dekProgress.phase === "ready"}
+          <p class="rotation-warning">
+            새 데이터베이스가 완성될 때까지 기존 DB를 유지합니다. 복사 도중 종료되면 기존 DB로 돌아가며, 파일 교체 도중 종료되면 다음 실행에서 자동 복구합니다.
+          </p>
+        {:else}
+          <div class="dek-progress" class:dek-progress--failed={dekProgress.phase === "failed"}>
+            <div class="dek-progress-heading">
+              <strong>{dekProgress.phase === "failed" ? "회전을 완료하지 못했습니다" : dekProgress.message}</strong>
+              <span>{dekProgress.percent}%</span>
+            </div>
+            <progress max="100" value={dekProgress.percent}>{dekProgress.percent}%</progress>
+            <span class="dek-progress-count">
+              {dekProgress.phase === "switching"
+                ? "안전하게 DB를 교체하는 중입니다. 앱을 종료하지 마세요."
+                : `${dekProgress.completed} / ${dekProgress.total}개 처리`}
+            </span>
+          </div>
+        {/if}
+
+        <div class="confirmation-actions rotation-actions">
+          <button class="mp-button mp-button--secondary" type="button" disabled={dekRotationRunning} onclick={closeDEKRotation}>닫기</button>
+          <button class="mp-button mp-button--primary" type="button" disabled={busy || dekRotationRunning} onclick={rotateDEK}>
+            {#if dekRotationRunning}<span class="mp-spinner"></span>{:else}<Icon name="refresh" size={16}/>{/if}
+            {dekRotationRunning ? "DEK 회전 중…" : dekProgress.phase === "failed" ? "다시 시도" : "DEK 회전 시작"}
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 {/if}

@@ -55,9 +55,142 @@ CREATE TABLE IF NOT EXISTS vault_key_envelopes (
 	rp_id TEXT NOT NULL,
 	nonce BLOB NOT NULL,
 	ciphertext BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS vault_dek_rotation (
+	id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+	header_revision INTEGER NOT NULL,
+	version INTEGER NOT NULL,
+	algorithm TEXT NOT NULL,
+	credential_id BLOB NOT NULL,
+	salt BLOB NOT NULL,
+	rp_id TEXT NOT NULL,
+	nonce BLOB NOT NULL,
+	ciphertext BLOB NOT NULL
 );`)
 	if err != nil {
 		return fmt.Errorf("migrate vault key envelope store: %w", err)
+	}
+	return nil
+}
+
+func (s *vaultKeyEnvelopeStore) stageDEKRotation(
+	ctx context.Context,
+	headerRevision uint64,
+	ref store.KEKReference,
+	vaultDEK, kek *memguard.Enclave,
+) error {
+	nonce, ciphertext, err := sealVaultKey(vaultDEK, kek, vaultKeyEnvelopeAAD(headerRevision, ref))
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO vault_dek_rotation (
+	id, header_revision, version, algorithm, credential_id, salt, rp_id, nonce, ciphertext
+) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+	header_revision = excluded.header_revision,
+	version = excluded.version,
+	algorithm = excluded.algorithm,
+	credential_id = excluded.credential_id,
+	salt = excluded.salt,
+	rp_id = excluded.rp_id,
+	nonce = excluded.nonce,
+	ciphertext = excluded.ciphertext`,
+		headerRevision,
+		vaultKeyEnvelopeVersion,
+		vaultKeyEnvelopeAlgorithm,
+		ref.CredentialID,
+		ref.Salt,
+		ref.RPID,
+		nonce,
+		ciphertext,
+	)
+	if err != nil {
+		return fmt.Errorf("stage DEK rotation: %w", err)
+	}
+	return nil
+}
+
+func (s *vaultKeyEnvelopeStore) hasStagedDEKRotation(ctx context.Context) (bool, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM vault_dek_rotation WHERE id = 1`).Scan(&count); err != nil {
+		return false, fmt.Errorf("check staged DEK rotation: %w", err)
+	}
+	return count == 1, nil
+}
+
+func (s *vaultKeyEnvelopeStore) promoteStagedDEKRotation(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin DEK rotation promotion: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		headerRevision uint64
+		version        uint16
+		algorithm      string
+		credentialID   []byte
+		salt           []byte
+		rpID           string
+		nonce          []byte
+		ciphertext     []byte
+	)
+	err = tx.QueryRowContext(ctx, `
+SELECT header_revision, version, algorithm, credential_id, salt, rp_id, nonce, ciphertext
+FROM vault_dek_rotation
+WHERE id = 1`).Scan(
+		&headerRevision,
+		&version,
+		&algorithm,
+		&credentialID,
+		&salt,
+		&rpID,
+		&nonce,
+		&ciphertext,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errVaultKeyEnvelopeNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("load staged DEK rotation: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO vault_key_envelopes (
+	header_revision, version, algorithm, credential_id, salt, rp_id, nonce, ciphertext
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(header_revision) DO UPDATE SET
+	version = excluded.version,
+	algorithm = excluded.algorithm,
+	credential_id = excluded.credential_id,
+	salt = excluded.salt,
+	rp_id = excluded.rp_id,
+	nonce = excluded.nonce,
+	ciphertext = excluded.ciphertext`,
+		headerRevision,
+		version,
+		algorithm,
+		credentialID,
+		salt,
+		rpID,
+		nonce,
+		ciphertext,
+	); err != nil {
+		return fmt.Errorf("promote rotated vault key: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM vault_dek_rotation WHERE id = 1`); err != nil {
+		return fmt.Errorf("clear promoted DEK rotation: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit DEK rotation promotion: %w", err)
+	}
+	return nil
+}
+
+func (s *vaultKeyEnvelopeStore) clearStagedDEKRotation(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM vault_dek_rotation WHERE id = 1`); err != nil {
+		return fmt.Errorf("clear staged DEK rotation: %w", err)
 	}
 	return nil
 }

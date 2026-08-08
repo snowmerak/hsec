@@ -23,12 +23,17 @@ interface.
   XChaCha20-Poly1305 encrypted, versioned field document. Field names and values
   are encrypted together as one atomic payload.
 - Initializing a vault performs exactly one FIDO credential creation and one
-  HMAC-secret derivation. Unlocking performs one derivation. The unwrapped vault
-  DEK remains sealed in a `memguard.Enclave` until the vault is locked.
+  HMAC-secret derivation. Unlocking performs one derivation. The active root KEK
+  and vault DEK remain sealed in `memguard.Enclave` values until the vault is
+  locked, allowing DEK rotation without another FIDO operation.
 - KEK rotation creates and derives one replacement root credential, then
   rewraps both the metadata-store DEK and vault DEK without rewriting encrypted
   values. Vaults from the older two-credential format migrate their vault DEK
   on the first successful unlock.
+- DEK rotation generates a new random key and re-encrypts every entry into a
+  shadow database while the original remains untouched. A small journal in
+  `keys.sqlite` makes the final file swap recoverable if the process or machine
+  stops at any point.
 - FIDO operations are serialized. If a create or derive operation takes longer
   than one second, the UI shows a persistent security-key touch prompt until the
   operation finishes.

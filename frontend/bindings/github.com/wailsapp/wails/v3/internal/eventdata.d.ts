@@ -12,6 +12,7 @@ import type * as main$0 from "../../../../snowmerak/hsec/models.js";
 declare module "@wailsio/runtime" {
     namespace Events {
         interface CustomEvents {
+            "vault:dek-rotation-progress": main$0.dekRotationProgress;
             "vault:fido-resolved": main$0.fidoEvent;
             "vault:fido-waiting": main$0.fidoEvent;
         }

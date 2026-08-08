@@ -247,11 +247,17 @@ func validateVaultDirectory(path string) error {
 		return errors.New("vault path must be a directory")
 	}
 	keysExists := fileExists(filepath.Join(path, "keys.sqlite"))
-	valuesExists := fileExists(filepath.Join(path, "vault.sqlite"))
-	if keysExists != valuesExists {
+	valuesExist := vaultValueFileSetExists(path)
+	if keysExists != valuesExist {
 		return errors.New("vault directory contains an incomplete vault")
 	}
 	return nil
+}
+
+func vaultValueFileSetExists(path string) bool {
+	return fileExists(filepath.Join(path, vaultValueFilename)) ||
+		fileExists(filepath.Join(path, vaultValueShadowFilename)) ||
+		fileExists(filepath.Join(path, vaultValueBackupFilename))
 }
 
 func vaultDirectoryAvailable(path string) bool {

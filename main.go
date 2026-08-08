@@ -13,6 +13,7 @@ var assets embed.FS
 func init() {
 	application.RegisterEvent[fidoEvent]("vault:fido-waiting")
 	application.RegisterEvent[fidoEvent]("vault:fido-resolved")
+	application.RegisterEvent[dekRotationProgress]("vault:dek-rotation-progress")
 }
 
 func main() {

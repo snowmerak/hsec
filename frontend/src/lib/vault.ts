@@ -52,6 +52,7 @@ export interface VaultAPI {
   Initialize(devicePath: string, pin: string): Promise<VaultStatus>;
   Unlock(devicePath: string, pin: string): Promise<VaultStatus>;
   RotateKEK(devicePath: string, pin: string): Promise<VaultStatus>;
+  RotateDEK(): Promise<VaultStatus>;
   Lock(): Promise<VaultStatus>;
   List(): Promise<VaultEntrySummary[]>;
   Get(alias: string): Promise<VaultEntry>;
@@ -181,6 +182,10 @@ const mockVault: VaultAPI = {
     } : reference);
     return mockStatus();
   },
+  async RotateDEK() {
+    if (!mockUnlocked) throw new Error("vault is locked");
+    return mockStatus();
+  },
   async Lock() {
     mockUnlocked = false;
     return mockStatus();
@@ -255,6 +260,9 @@ const wailsVault: VaultAPI = {
   },
   async RotateKEK(devicePath, pin) {
     return WailsVault.RotateKEK(devicePath, pin);
+  },
+  async RotateDEK() {
+    return WailsVault.RotateDEK();
   },
   async Lock() {
     return WailsVault.Lock();

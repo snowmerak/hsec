@@ -11,6 +11,14 @@ export interface authenticatorInfo {
     "windowsHello": boolean;
 }
 
+export interface dekRotationProgress {
+    "phase": string;
+    "completed": number;
+    "total": number;
+    "percent": number;
+    "message": string;
+}
+
 export interface fidoEvent {
     "operationId": string;
     "phase": string;

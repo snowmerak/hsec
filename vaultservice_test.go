@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -306,6 +307,228 @@ func TestVaultLifecycleAndEncryptedStorage(t *testing.T) {
 	}
 	if _, err := service.Get(ctx, alias); err != errEntryNotFound {
 		t.Fatalf("got deleted entry error %v, want %v", err, errEntryNotFound)
+	}
+}
+
+func TestRotateDEKReencryptsValuesWithoutFIDO(t *testing.T) {
+	ctx := context.Background()
+	auth := &fakeAuthenticator{}
+	service, dataDir := newTestVaultService(t, auth)
+	if _, err := service.Initialize(ctx, "fake://security-key", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range 12 {
+		alias := fmt.Sprintf("entry-%02d", i)
+		if _, err := service.Create(ctx, alias, vaultValueDocument{
+			Version: vaultValueDocumentVersion,
+			Fields:  []vaultValueField{{Name: "secret", Value: fmt.Sprintf("value-%02d", i)}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var beforeCiphertext []byte
+	if err := service.values.db.QueryRowContext(ctx,
+		`SELECT ciphertext FROM vault_entries WHERE alias = ?`, "entry-00",
+	).Scan(&beforeCiphertext); err != nil {
+		t.Fatal(err)
+	}
+	credentialsBefore, derivationsBefore := auth.counts()
+
+	var progress []dekRotationProgress
+	service.setEmitter(func(name string, data any) {
+		if name == "vault:dek-rotation-progress" {
+			progress = append(progress, data.(dekRotationProgress))
+		}
+	})
+	status, err := service.RotateDEK(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !status.Unlocked {
+		t.Fatalf("unexpected status after DEK rotation: %+v", status)
+	}
+	credentialsAfter, derivationsAfter := auth.counts()
+	if credentialsAfter != credentialsBefore || derivationsAfter != derivationsBefore {
+		t.Fatalf("DEK rotation used FIDO: before=(%d,%d) after=(%d,%d)", credentialsBefore, derivationsBefore, credentialsAfter, derivationsAfter)
+	}
+	if len(progress) < 4 || progress[0].Phase != "copying" || progress[len(progress)-1].Phase != "completed" {
+		t.Fatalf("unexpected DEK rotation progress: %+v", progress)
+	}
+	last := progress[len(progress)-1]
+	if last.Completed != 12 || last.Total != 12 || last.Percent != 100 {
+		t.Fatalf("unexpected final DEK rotation progress: %+v", last)
+	}
+
+	var afterCiphertext []byte
+	if err := service.values.db.QueryRowContext(ctx,
+		`SELECT ciphertext FROM vault_entries WHERE alias = ?`, "entry-00",
+	).Scan(&afterCiphertext); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(beforeCiphertext, afterCiphertext) {
+		t.Fatal("vault entry ciphertext did not change during DEK rotation")
+	}
+	for i := range 12 {
+		alias := fmt.Sprintf("entry-%02d", i)
+		entry, err := service.Get(ctx, alias)
+		if err != nil || entry.Value.Fields[0].Value != fmt.Sprintf("value-%02d", i) {
+			t.Fatalf("read %s after DEK rotation: entry=%+v err=%v", alias, entry, err)
+		}
+	}
+	for _, filename := range []string{vaultValueShadowFilename, vaultValueBackupFilename} {
+		if fileExists(filepath.Join(dataDir, filename)) {
+			t.Fatalf("temporary DEK rotation file remains: %s", filename)
+		}
+	}
+	staged, err := service.vaultKeys.hasStagedDEKRotation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staged {
+		t.Fatal("DEK rotation journal was not cleared")
+	}
+
+	service.Lock()
+	if _, err := service.Unlock(ctx, "fake://security-key", ""); err != nil {
+		t.Fatalf("unlock after DEK rotation: %v", err)
+	}
+	if _, err := service.Get(ctx, "entry-00"); err != nil {
+		t.Fatalf("read after reopening rotated DEK: %v", err)
+	}
+}
+
+func TestInterruptedDEKSwapIsCompletedOnReopen(t *testing.T) {
+	ctx := context.Background()
+	auth := &fakeAuthenticator{}
+	service, dataDir := newTestVaultService(t, auth)
+	if _, err := service.Initialize(ctx, "fake://security-key", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create(ctx, "survivor", vaultValueDocument{
+		Version: vaultValueDocumentVersion,
+		Fields:  []vaultValueField{{Name: "secret", Value: "still-readable"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	header, err := service.metadata.Header(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDEK, err := randomVaultKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadowPath := filepath.Join(dataDir, vaultValueShadowFilename)
+	shadow, err := openVaultValueStore(shadowPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := copyVaultValues(ctx, service.values, shadow, service.vaultDEK, newDEK, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.vaultKeys.stageDEKRotation(ctx, header.Revision, header.KEK, newDEK, service.rootKEK); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.values.close(); err != nil {
+		t.Fatal(err)
+	}
+	service.values = nil
+	if err := swapVaultValueFiles(dataDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the crash point: both file renames completed, but the staged
+	// wrapper has not yet replaced the old vault-DEK envelope.
+	if err := recoverDEKRotationFiles(dataDir, service.vaultKeys); err != nil {
+		t.Fatal(err)
+	}
+	service.values, err = openVaultValueStore(filepath.Join(dataDir, vaultValueFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(filepath.Join(dataDir, vaultValueBackupFilename)) {
+		t.Fatal("old vault database remains after recovery")
+	}
+	staged, err := service.vaultKeys.hasStagedDEKRotation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staged {
+		t.Fatal("recovered DEK rotation journal was not cleared")
+	}
+
+	service.Lock()
+	if _, err := service.Unlock(ctx, "fake://security-key", ""); err != nil {
+		t.Fatalf("unlock recovered vault: %v", err)
+	}
+	entry, err := service.Get(ctx, "survivor")
+	if err != nil || entry.Value.Fields[0].Value != "still-readable" {
+		t.Fatalf("read recovered entry: entry=%+v err=%v", entry, err)
+	}
+}
+
+func TestInterruptedDEKPreparationKeepsOriginalDatabase(t *testing.T) {
+	ctx := context.Background()
+	auth := &fakeAuthenticator{}
+	service, dataDir := newTestVaultService(t, auth)
+	if _, err := service.Initialize(ctx, "fake://security-key", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create(ctx, "original", vaultValueDocument{
+		Version: vaultValueDocumentVersion,
+		Fields:  []vaultValueField{{Name: "secret", Value: "old-db-remains-authoritative"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	header, err := service.metadata.Header(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newDEK, err := randomVaultKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadowPath := filepath.Join(dataDir, vaultValueShadowFilename)
+	shadow, err := openVaultValueStore(shadowPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := copyVaultValues(ctx, service.values, shadow, service.vaultDEK, newDEK, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.vaultKeys.stageDEKRotation(ctx, header.Revision, header.KEK, newDEK, service.rootKEK); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the crash point before either live-file rename. Recovery must
+	// discard the shadow and leave both the live DB and old wrapper untouched.
+	if err := recoverDEKRotationFiles(dataDir, service.vaultKeys); err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(shadowPath) {
+		t.Fatal("pre-swap shadow database remains after recovery")
+	}
+	staged, err := service.vaultKeys.hasStagedDEKRotation(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staged {
+		t.Fatal("pre-swap DEK rotation journal remains after recovery")
+	}
+	service.Lock()
+	if _, err := service.Unlock(ctx, "fake://security-key", ""); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := service.Get(ctx, "original")
+	if err != nil || entry.Value.Fields[0].Value != "old-db-remains-authoritative" {
+		t.Fatalf("read original entry after recovery: entry=%+v err=%v", entry, err)
 	}
 }
 

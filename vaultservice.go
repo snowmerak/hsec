@@ -61,6 +61,7 @@ type VaultService struct {
 	metadata  *encryptedstore.Store
 	vaultKeys *vaultKeyEnvelopeStore
 	values    *vaultValueStore
+	rootKEK   *memguard.Enclave
 	vaultDEK  *memguard.Enclave
 
 	devices  func(hmacsecret.ListOptions) ([]hmacsecret.DeviceInfo, error)
@@ -85,7 +86,7 @@ func NewVaultService(appDataDir string) (*VaultService, error) {
 
 	// Register the pre-registry default vault in place. Nothing is moved.
 	if fileExists(filepath.Join(appDataDir, "keys.sqlite")) &&
-		fileExists(filepath.Join(appDataDir, "vault.sqlite")) {
+		vaultValueFileSetExists(appDataDir) {
 		if _, err := registry.add(context.Background(), appDataDir); err != nil {
 			_ = registry.close()
 			return nil, fmt.Errorf("register existing default vault: %w", err)
@@ -122,7 +123,12 @@ func openVaultStores(dataDir string) (*encryptedstore.Store, *vaultKeyEnvelopeSt
 		_ = metadata.Close()
 		return nil, nil, nil, err
 	}
-	values, err := openVaultValueStore(filepath.Join(dataDir, "vault.sqlite"))
+	if err := recoverDEKRotationFiles(dataDir, vaultKeys); err != nil {
+		_ = vaultKeys.close()
+		_ = metadata.Close()
+		return nil, nil, nil, fmt.Errorf("recover interrupted DEK rotation: %w", err)
+	}
+	values, err := openVaultValueStore(filepath.Join(dataDir, vaultValueFilename))
 	if err != nil {
 		_ = vaultKeys.close()
 		_ = metadata.Close()
@@ -328,6 +334,7 @@ func (s *VaultService) Initialize(ctx context.Context, devicePath, pin string) (
 		return vaultStatus{}, fmt.Errorf("initialize encrypted key store: %w", err)
 	}
 	s.vaultDEK = dek
+	s.rootKEK = rootKEK
 	if err := s.registry.rememberDevice(ctx, s.selected.Path, device); err != nil {
 		s.lockLocked()
 		return vaultStatus{}, err
@@ -395,6 +402,7 @@ func (s *VaultService) Unlock(ctx context.Context, devicePath, pin string) (vaul
 	}
 	_ = s.vaultKeys.deleteExcept(ctx, header.Revision)
 	s.vaultDEK = dek
+	s.rootKEK = rootKEK
 	if err := s.registry.rememberDevice(ctx, s.selected.Path, device); err != nil {
 		s.lockLocked()
 		return vaultStatus{}, err
@@ -468,6 +476,7 @@ func (s *VaultService) RotateKEK(ctx context.Context, devicePath, pin string) (v
 		return vaultStatus{}, fmt.Errorf("rotate vault KEK: %w", err)
 	}
 	_ = s.vaultKeys.deleteExcept(ctx, nextRevision)
+	s.rootKEK = nextKEK
 
 	s.selected.PreferredDevicePath = device.Path
 	s.selected.PreferredDeviceProduct = device.Product
@@ -646,6 +655,7 @@ func (s *VaultService) lockLocked() {
 		s.metadata.Lock()
 	}
 	s.vaultDEK = nil
+	s.rootKEK = nil
 	memguard.Purge()
 }
 

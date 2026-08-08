@@ -46,6 +46,15 @@ export function Lock(): $CancellablePromise<$models.vaultStatus> {
 }
 
 /**
+ * RotateDEK generates a new random vault DEK and re-encrypts every value into
+ * a shadow database. The old database remains untouched until the shadow is
+ * complete and its wrapped DEK has been staged in keys.sqlite.
+ */
+export function RotateDEK(): $CancellablePromise<$models.vaultStatus> {
+    return $Call.ByID(1373685270);
+}
+
+/**
  * RotateKEK replaces the public root credential reference and rewraps the
  * metadata-store DEK without rewriting the encrypted vault metadata or values.
  * The vault must already be unlocked so the existing metadata-store DEK is
